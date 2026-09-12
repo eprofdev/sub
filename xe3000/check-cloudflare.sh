@@ -26,11 +26,16 @@ get() { curl -sS --max-time 30 -H "Authorization: Bearer $T" "$API$1" 2>&1; }
 okjson() { printf '%s' "$1" | grep -q '"success":[[:space:]]*true'; }
 
 RESULT=
+REACHED=0          # 1 إذا ردّ Cloudflare بجسم JSON ولو مرة واحدة
 
 check() { # $1 رقم، $2 وصف، $3 مسار
     printf -- '--%s %s--\n' "$1" "$2"
     _r=$(get "$3")
     printf '%s\n' "$_r" | head -c 300; echo
+    # ردّ Cloudflare يحوي دائمًا "success" — غيابه يعني أن الطلب لم يصل أصلًا
+    case "$_r" in
+        *'"success"'*) REACHED=1 ;;
+    esac
     if okjson "$_r"; then
         echo "[OK] نجح"
         RESULT="$RESULT$1:ok "
@@ -48,13 +53,21 @@ check 4 "صلاحية الأنفاق"  "/accounts/$A/cfd_tunnel?per_page=1"
 
 echo "================ الخلاصة ================"
 echo "$RESULT"
+
+if [ "$REACHED" = 0 ]; then
+    echo "لم يصل أي طلب إلى api.cloudflare.com → لا إنترنت أو DNS معطّل على الراوتر."
+    echo "جرّب: ping -c1 1.1.1.1   ثم   nslookup api.cloudflare.com"
+    exit 1
+fi
+
+# وصلت الطلبات وردّ Cloudflare — إذًا السبب في القيم أو الصلاحيات لا في الشبكة.
 case "$RESULT" in
-    *1:fail*2:fail*3:fail*4:fail*)
-        echo "الكل فشل → لا إنترنت أو DNS معطّل على الراوتر." ;;
     *1:fail*)
-        echo "الفحص 1 فشل → التوكن خاطئ أو منتهٍ أو فيه محرف زائد." ;;
+        echo "الفحص 1 فشل → التوكن خاطئ أو منتهٍ أو فيه محرف زائد."
+        echo "أعد إنشاءه، ثم: sh /root/xe3000autouiinput.sh forget-creds" ;;
     *2:fail*3:fail*)
-        echo "2 و 3 فشلا → التوكن صالح لكن المعرّفات من حساب آخر." ;;
+        echo "2 و 3 فشلا والتوكن صالح → المعرّفان من حساب آخر."
+        echo "انسخ Account ID و Zone ID من لوحة Cloudflare لنفس الحساب." ;;
     *2:fail*)
         echo "الفحص 2 فقط → Account ID خاطئ." ;;
     *3:fail*)
@@ -67,5 +80,7 @@ case "$RESULT" in
         echo "ثم: sh /root/xe3000autouiinput.sh forget-creds && sh /root/xe3000autouiinput.sh install" ;;
     *)
         echo "الفحوصات الأربعة نجحت → المعرّفات والصلاحيات سليمة."
-        echo "أكمل التثبيت: sh /root/xe3000autouiinput.sh" ;;
+        echo "أكمل التثبيت: sh /root/xe3000autouiinput.sh"
+        exit 0 ;;
 esac
+exit 1
