@@ -17,6 +17,10 @@ LOGFILE=/var/log/xe3000-fulltunnel.log
 API=https://api.cloudflare.com/client/v4
 UI_PORT=9000
 SELF=$0
+case "$0" in
+    /*) SELF_ABS=$0 ;;
+    *)  SELF_ABS=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0") ;;
+esac
 
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
@@ -588,8 +592,9 @@ HTML
 else
 cat <<'HTML'
 <div class="card"><p class="warn">البوابة غير مثبتة.</p>
-<p>ملفا الخدمة يُنشآن في الخطوة [4/6]. غيابهما يعني أن التثبيت توقف قبلها.
-شغّل على الراوتر:</p><pre>sh /root/xe3000autouiinput.sh</pre></div>
+<p>ملفا الخدمة يُنشآن في الخطوة [4/6]. غيابهما يعني أن التثبيت توقف قبلها.</p>
+<p><a class="btn" href="setup.cgi">افتح صفحة الإعداد</a></p>
+<p>أو على الراوتر مباشرة:</p><pre>sh /root/xe3000autouiinput.sh install</pre></div>
 HTML
 fi
 cat <<HTML
@@ -601,7 +606,86 @@ cat <<HTML
 </div>
 HTML
 UICGI
-    chmod 755 "$UIROOT/cgi-bin/control.cgi"
+    cat >"$UIROOT/cgi-bin/setup.cgi" <<'UISETUP'
+#!/bin/sh
+CREDS=/etc/xe3000-cf-fulltunnel-creds
+INSTALLER='@SELF@'
+LOG=/var/log/xe3000-fulltunnel-setup.log
+MSG=; OKMSG=
+
+dec() { # فك ترميز URL
+    printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%\(..\)/\\x\1/g')"
+}
+field() { printf '%s' "$BODY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+valid_id()   { case "${1:-}" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac; }
+valid_host() { case "${1:-}" in ''|*[!A-Za-z0-9.-]*) return 1;; *.*) return 0;; esac; return 1; }
+
+BODY=
+if [ "${REQUEST_METHOD:-GET}" = POST ] && [ -n "${CONTENT_LENGTH:-}" ]; then
+    BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+fi
+
+if [ -n "$BODY" ]; then
+    H=$(dec "$(field hostname)"); A=$(dec "$(field account)")
+    Z=$(dec "$(field zone)");     T=$(dec "$(field token)")
+    if ! valid_host "$H"; then MSG="اسم المضيف غير صالح."
+    elif ! valid_id "$A";  then MSG="Account ID غير صالح."
+    elif ! valid_id "$Z";  then MSG="Zone ID غير صالح."
+    elif ! valid_id "$T";  then MSG="التوكن غير صالح أو فيه محرف زائد."
+    else
+        mkdir -p "$CREDS" && chmod 700 "$CREDS"
+        printf '%s' "$H" >"$CREDS/hostname";   printf '%s' "$A" >"$CREDS/account-id"
+        printf '%s' "$Z" >"$CREDS/zone-id";    printf '%s' "$T" >"$CREDS/api-token"
+        chmod 600 "$CREDS"/hostname "$CREDS"/account-id "$CREDS"/zone-id "$CREDS"/api-token
+        if [ -x "$INSTALLER" ] || [ -f "$INSTALLER" ]; then
+            : >"$LOG"; chmod 600 "$LOG"
+            FULLTUNNEL_RESTORE_UI=1 setsid sh "$INSTALLER" >>"$LOG" 2>&1 &
+            OKMSG="حُفظت البيانات وبدأ التثبيت في الخلفية. تابع السجل أدناه."
+        else
+            OKMSG="حُفظت البيانات. شغّل على الراوتر: sh $INSTALLER"
+        fi
+    fi
+fi
+
+printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
+cat <<HTML
+<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>إعداد XE3000</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px}
+.c{max-width:560px;margin:auto}h1{font-size:1.25rem}
+.card{background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:14px;margin:12px 0}
+label{display:block;margin:10px 0 4px}
+input{width:100%;box-sizing:border-box;padding:8px;border-radius:4px;border:1px solid #444;background:#111;color:#eee}
+button{margin-top:14px;background:#2d6cdf;color:#fff;border:0;padding:10px 18px;border-radius:6px;font-size:1rem}
+.err{background:#3a1111;border:1px solid #7a2020;padding:10px;border-radius:6px}
+.ok{background:#0f2d16;border:1px solid #2a6b3a;padding:10px;border-radius:6px}
+pre{background:#0b0b0b;padding:10px;border-radius:6px;overflow-x:auto;max-height:260px}
+small{color:#9a9a9a}
+</style><div class="c"><h1>إعداد XE3000 Cloudflare Full-Tunnel</h1>
+HTML
+[ -n "$MSG" ]   && printf '<div class="err">%s</div>' "$MSG"
+[ -n "$OKMSG" ] && printf '<div class="ok">%s</div>' "$OKMSG"
+cat <<'HTML'
+<form method="post" class="card">
+<label>المضيف الكامل<input name="hostname" placeholder="home.example.com" required></label>
+<label>Account ID<input name="account" required></label>
+<label>Zone ID<input name="zone" required></label>
+<label>API Token<input name="token" type="password" required></label>
+<small>التوكن يحتاج صلاحيتين فقط: Account · Cloudflare Tunnel · Edit، و Zone · DNS · Edit</small>
+<button>احفظ وابدأ التثبيت</button>
+</form>
+HTML
+if [ -s "$LOG" ]; then
+    printf '<div class="card"><b>سجل التثبيت</b><pre>'
+    tail -40 "$LOG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+    printf '</pre><a href="">تحديث</a></div>'
+fi
+printf '<p><a href="control.cgi">لوحة التحكم</a></p></div>'
+UISETUP
+    sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/setup.cgi"
+    chmod 755 "$UIROOT/cgi-bin/control.cgi" "$UIROOT/cgi-bin/setup.cgi"
     ok "كُتبت ملفات اللوحة"
 }
 
@@ -661,8 +745,26 @@ configure_uhttpd() {
     uci add_list uhttpd.xe3000.index_page=index.html
     [ -f "$UIROOT/httpd.conf" ] && uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
     uci commit uhttpd
-    /etc/init.d/uhttpd reload >/dev/null 2>&1 || /etc/init.d/uhttpd restart >/dev/null 2>&1
-    ok "اللوحة على https://$_ip:$UI_PORT/"
+
+    # فتح المنفذ على شبكة LAN فقط — بعض صور GL.iNet ترفض المدخلات غير المصرّح بها
+    uci -q delete firewall.xe3000_panel
+    uci set firewall.xe3000_panel=rule
+    uci set firewall.xe3000_panel.name='xe3000-panel'
+    uci set firewall.xe3000_panel.src='lan'
+    uci set firewall.xe3000_panel.proto='tcp'
+    uci set firewall.xe3000_panel.dest_port="$UI_PORT"
+    uci set firewall.xe3000_panel.target='ACCEPT'
+    uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1 || warn "تعذر إعادة تحميل الجدار الناري"
+
+    # قسم جديد لا يلتقطه reload دائمًا — أعد التشغيل
+    /etc/init.d/uhttpd restart >/dev/null 2>&1 || die "تعذر إعادة تشغيل uhttpd"
+    sleep 1
+    if netstat -ltn 2>/dev/null | grep -q "$_ip:$UI_PORT "; then
+        ok "اللوحة تستمع على https://$_ip:$UI_PORT/"
+    else
+        warn "uhttpd أُعيد تشغيله لكن المنفذ $UI_PORT لا يستمع — شغّل: sh $SELF diagnose"
+    fi
 }
 
 install_ui() {
@@ -749,7 +851,13 @@ do_diagnose() {
     /etc/init.d/uhttpd status 2>&1 | head -5
     uci -q show uhttpd.xe3000 || say "لا يوجد قسم uhttpd.xe3000"
     say "--- المنفذ $UI_PORT ---"
-    netstat -ltn 2>/dev/null | grep ":$UI_PORT " || say "المنفذ $UI_PORT غير مفتوح"
+    netstat -ltn 2>/dev/null | grep ":$UI_PORT " || say "المنفذ $UI_PORT لا يستمع"
+    say "--- عملية uhttpd ---"
+    ps w 2>/dev/null | grep -v grep | grep uhttpd || say "لا توجد عملية uhttpd"
+    say "--- الجدار الناري ---"
+    uci -q show firewall.xe3000_panel || say "لا توجد قاعدة xe3000_panel — شغّل repair-ui"
+    say "--- عنوان LAN ---"
+    say "المتوقع: $(lan_ip):$UI_PORT"
     say "--- الشهادة ---"
     [ -f /etc/uhttpd.crt ] && say "/etc/uhttpd.crt موجودة" || say "/etc/uhttpd.crt مفقودة"
     say "--- الأوامر ---"
@@ -782,6 +890,8 @@ do_remove() {
         rm -f /etc/init.d/$s
     done
     uci -q delete uhttpd.xe3000 && uci commit uhttpd
+    uci -q delete firewall.xe3000_panel && uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
     /etc/init.d/uhttpd reload >/dev/null 2>&1
     rm -rf "$BASE"
     ok "أُزيلت البوابة. البيانات المحفوظة في $CREDS لم تُمس (احذفها بـ forget-creds)."
@@ -798,7 +908,7 @@ do_bootstrap() {
     write_ui_files
     set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
     configure_uhttpd
-    ok "افتح https://$(lan_ip):$UI_PORT/ لإكمال الإعداد."
+    ok "افتح https://$(lan_ip):$UI_PORT/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
 }
 
 # لا وسائط: يقرر وحده
@@ -818,7 +928,12 @@ do_auto_self() {
         do_install
         return $?
     fi
-    say "لا توجد بيانات محفوظة — فتح صفحة الإعداد."
+    if has_tty; then
+        say "لا توجد بيانات محفوظة — تثبيت تفاعلي."
+        do_install
+        return $?
+    fi
+    say "لا توجد بيانات محفوظة وبلا طرفية — فتح صفحة الإعداد."
     do_bootstrap
 }
 
