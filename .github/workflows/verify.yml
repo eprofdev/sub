@@ -1,0 +1,63 @@
+name: verify
+
+on:
+  push:
+    paths: ['xe3000/**', '.github/workflows/verify.yml']
+  pull_request:
+    paths: ['xe3000/**', '.github/workflows/verify.yml']
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: xe3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: POSIX syntax (sh + dash)
+        run: |
+          set -eu
+          for f in xe3000autouiinput.sh check-cloudflare.sh; do
+            sh   -n "$f"
+            dash -n "$f"
+            echo "syntax ok: $f"
+          done
+
+      - name: Generated CGI syntax
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          # ui-only يحتاج root، ويكتب ملفات اللوحة ثم يفشل عند الشهادة —
+          # الملفات المكتوبة تكفي للفحص.
+          sudo sh "$T/x.sh" ui-only || true
+          sudo chmod -R a+rX "$T"
+          dash -n "$T/base/ui/cgi-bin/control.cgi"
+          echo "cgi syntax ok"
+
+      - name: CGI rejects unknown action (no reflected input)
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          sudo sh "$T/x.sh" ui-only || true
+          sudo chmod -R a+rX "$T"
+          out=$(QUERY_STRING='action=<script>alert(1)</script>' sh "$T/base/ui/cgi-bin/control.cgi")
+          if printf '%s' "$out" | grep -q '<script>alert(1)</script>'; then
+            echo "reflected input found in CGI output"; exit 1
+          fi
+          echo "no reflected input"
+
+      - name: SHA256SUMS matches tracked files
+        run: sha256sum -c SHA256SUMS
+
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -s sh -S warning xe3000autouiinput.sh check-cloudflare.sh

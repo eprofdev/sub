@@ -1,0 +1,71 @@
+#!/bin/sh
+# فحوصات Cloudflare الأربعة — القسم 3 من سجل العمل.
+# يُشغَّل على الراوتر لتحديد سبب فشل الخطوة [3/6].
+#   sh check-cloudflare.sh                 # يقرأ البيانات المحفوظة
+#   sh check-cloudflare.sh <token> <account> <zone>
+set -u
+
+CREDS=/etc/xe3000-cf-fulltunnel-creds
+API=https://api.cloudflare.com/client/v4
+
+if [ $# -ge 3 ]; then
+    T=$1; A=$2; Z=$3
+elif [ -s "$CREDS/api-token" ]; then
+    T=$(cat "$CREDS/api-token")
+    A=$(cat "$CREDS/account-id")
+    Z=$(cat "$CREDS/zone-id")
+else
+    echo "[ER] لا توجد بيانات محفوظة في $CREDS" >&2
+    echo "الاستخدام: sh $0 <api-token> <account-id> <zone-id>" >&2
+    exit 1
+fi
+
+command -v curl >/dev/null 2>&1 || { echo "[ER] curl غير مثبت: opkg install curl" >&2; exit 1; }
+
+get() { curl -sS --max-time 30 -H "Authorization: Bearer $T" "$API$1" 2>&1; }
+okjson() { printf '%s' "$1" | grep -q '"success":[[:space:]]*true'; }
+
+RESULT=
+
+check() { # $1 رقم، $2 وصف، $3 مسار
+    printf -- '--%s %s--\n' "$1" "$2"
+    _r=$(get "$3")
+    printf '%s\n' "$_r" | head -c 300; echo
+    if okjson "$_r"; then
+        echo "[OK] نجح"
+        RESULT="$RESULT$1:ok "
+    else
+        echo "[ER] فشل"
+        RESULT="$RESULT$1:fail "
+    fi
+    echo
+}
+
+check 1 "التوكن"          "/user/tokens/verify"
+check 2 "الحساب"          "/accounts/$A"
+check 3 "النطاق"          "/zones/$Z"
+check 4 "صلاحية الأنفاق"  "/accounts/$A/cfd_tunnel?per_page=1"
+
+echo "================ الخلاصة ================"
+echo "$RESULT"
+case "$RESULT" in
+    *1:fail*2:fail*3:fail*4:fail*)
+        echo "الكل فشل → لا إنترنت أو DNS معطّل على الراوتر." ;;
+    *1:fail*)
+        echo "الفحص 1 فشل → التوكن خاطئ أو منتهٍ أو فيه محرف زائد." ;;
+    *2:fail*3:fail*)
+        echo "2 و 3 فشلا → التوكن صالح لكن المعرّفات من حساب آخر." ;;
+    *2:fail*)
+        echo "الفحص 2 فقط → Account ID خاطئ." ;;
+    *3:fail*)
+        echo "الفحص 3 فقط → Zone ID خاطئ أو ليس في نفس الحساب." ;;
+    *4:fail*)
+        echo "الفحص 4 فقط → التوكن ينقصه: Account · Cloudflare Tunnel · Edit"
+        echo "أنشئ توكنًا من My Profile ← API Tokens ← Create Token بصلاحيتين فقط:"
+        echo "  Account · Cloudflare Tunnel · Edit"
+        echo "  Zone    · DNS             · Edit"
+        echo "ثم: sh /root/xe3000autouiinput.sh forget-creds && sh /root/xe3000autouiinput.sh install" ;;
+    *)
+        echo "الفحوصات الأربعة نجحت → المعرّفات والصلاحيات سليمة."
+        echo "أكمل التثبيت: sh /root/xe3000autouiinput.sh" ;;
+esac
