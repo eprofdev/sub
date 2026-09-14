@@ -4,7 +4,7 @@
 # ملف واحد، بلا حمولة مضمّنة — يعمل مع wget/curl إلى ملف ثم sh.
 set -u
 
-VERSION="2026-09-14-menu"
+VERSION="2026-09-12-single-file"
 
 BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
@@ -15,7 +15,6 @@ CFD_DIR=$BASE/cloudflared
 XRAY_DIR=$BASE/xray
 LOGFILE=/var/log/xe3000-fulltunnel.log
 API=https://api.cloudflare.com/client/v4
-UPDATE_BASE=${FULLTUNNEL_UPDATE_BASE:-https://raw.githubusercontent.com/eprofdev/sub/main/xe3000}
 UI_PORT=9000            # مدخل HTTP، يحوّل إلى HTTPS
 UI_PORT_S=9443          # منفذ HTTPS الفعلي
 SELF=$0
@@ -36,18 +35,6 @@ warn() { printf '[!!] %s\n' "$*"; }
 err()  { printf '[ER] %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 step() { printf '[%s/6] %s\n' "$1" "$2"; }
-
-# الناتج التشخيصي يُلصق كثيرًا في محادثات ومنتديات: نُخفي ما يعرّف التثبيت.
-# FULLTUNNEL_SHOW_SECRETS=1 يُظهرها، وأمر links يطبع الروابط كاملة دائمًا.
-mask() {
-    _v=${1:-}
-    [ -n "$_v" ] || { printf '(فارغ)'; return 0; }
-    [ "${FULLTUNNEL_SHOW_SECRETS:-0}" = 1 ] && { printf '%s' "$_v"; return 0; }
-    _n=${#_v}
-    if [ "$_n" -le 6 ]; then printf '******'
-    else printf '%s…%s' "$(printf '%s' "$_v" | cut -c1-4)" "$(printf '%s' "$_v" | cut -c$((_n-1))-)"
-    fi
-}
 
 need_root() {
     [ "$(id -u)" = 0 ] || die "يجب التشغيل بصلاحية root."
@@ -144,7 +131,7 @@ forget_creds() {
 creds_status() {
     if creds_saved; then
         say "بيانات Cloudflare: محفوظة"
-        say "  المضيف     : $(mask "$(cat "$CREDS/hostname")")"
+        say "  المضيف     : $(cat "$CREDS/hostname")"
         say "  الحساب     : $(cat "$CREDS/account-id" | cut -c1-8)…"
         say "  النطاق     : $(cat "$CREDS/zone-id" | cut -c1-8)…"
         say "  التوكن     : محفوظ (لا يُعرض)"
@@ -264,7 +251,7 @@ preflight_cloudflare() {
     _r=$(cf GET "/zones/$CF_ZONE")
     if cf_success "$_r"; then
         _zn=$(jf "$_r" '@.result.name')
-        ok "3/4 النطاق: $(mask "$_zn")"
+        ok "3/4 النطاق: $_zn"
         case "$CF_HOSTNAME" in
             "$_zn"|*".$_zn") : ;;
             *) err "3/4 المضيف '$CF_HOSTNAME' ليس تابعًا للنطاق '$_zn'."; _fail=1 ;;
@@ -570,7 +557,7 @@ create_tunnel() {
     cf_success "$_r" || die "فشل إنشاء النفق: $(cf_errors "$_r")"
     TUNNEL_ID=$(jf "$_r" '@.result.id')
     [ -n "$TUNNEL_ID" ] || die "استجابة Cloudflare بلا معرّف نفق."
-    ok "أُنشئ النفق $(mask "$TUNNEL_NAME") ($(mask "$TUNNEL_ID"))"
+    ok "أُنشئ النفق $TUNNEL_NAME ($TUNNEL_ID)"
 }
 
 create_or_update_dns() {
@@ -588,7 +575,7 @@ create_or_update_dns() {
         _act="أُنشئ"
     fi
     cf_success "$_r" || die "فشل سجل DNS: $(cf_errors "$_r")"
-    ok "$_act سجل CNAME: $(mask "$CF_HOSTNAME") ← $(mask "$_content")"
+    ok "$_act سجل CNAME: $CF_HOSTNAME ← $_content"
 }
 
 # ----------------------------------------------------------------- [4/6] ملفات الإعداد
@@ -600,16 +587,14 @@ write_configs() {
         "$CF_ACCOUNT" "$TUNNEL_ID" "$TUNNEL_SECRET" >"$BASE/tunnel/$TUNNEL_ID.json"
     chmod 600 "$BASE/tunnel/$TUNNEL_ID.json"
 
-    # قيمة محمّلة من إعداد قائم تسبق البيئة، والبيئة تسبق الافتراضي:
-    # هكذا لا يتولّد مسار ولا منفذ جديد فوق تثبيت موجود فتنكسر روابط العملاء.
-    XRAY_PORT=${XRAY_PORT:-${FULLTUNNEL_XRAY_PORT:-18443}}
-    XRAY_LISTEN=${XRAY_LISTEN:-${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}}
-    XRAY_NET=${XRAY_NET:-${FULLTUNNEL_XRAY_NET:-ws}}
-    XRAY_PROTO=${XRAY_PROTO:-${FULLTUNNEL_PROTO:-vless}}
-    SSHWS=${SSHWS:-${FULLTUNNEL_SSHWS:-0}}
-    SSH_PATH=${SSH_PATH:-${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}}
+    XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
+    XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
+    XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
+    XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
+    SSHWS=${FULLTUNNEL_SSHWS:-0}
+    SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}
     SSH_PORT=$(( XRAY_PORT + 1 ))
-    XRAY_WSPATH=${XRAY_WSPATH:-${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}}
+    XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
     users_init
     if [ ! -s "$USERS" ]; then
         XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}
@@ -1026,15 +1011,13 @@ if [ "${REQUEST_METHOD:-GET}" = POST ] && [ -n "${CONTENT_LENGTH:-}" ]; then
   BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
 fi
 ACT=$(arg action)
-case "$ACT" in ''|start|stop|restart|useradd|userdel|forget|authon|authoff) : ;; *) ACT=invalid ;; esac
+case "$ACT" in ''|start|stop|restart|useradd|userdel|forget) : ;; *) ACT=invalid ;; esac
 
 installed() { [ -f "$SETTINGS" ] && [ -x /etc/init.d/xe3000-cf-tunnel ]; }
 run() { [ -f "$INSTALLER" ] && sh "$INSTALLER" "$@" 2>&1; }
 
 if [ -n "$ACT" ]; then
-  # حماية اللوحة وحذف البيانات لا يتوقفان على اكتمال تثبيت البوابة
-  case "$ACT" in forget|authon|authoff) _needinst=0 ;; *) _needinst=1 ;; esac
-  if [ "$_needinst" = 1 ] && ! installed; then
+  if ! installed && [ "$ACT" != forget ]; then
     MSG="البوابة غير مثبتة — لا يمكن تنفيذ الأمر."; CLS=err
   else
     case "$ACT" in
@@ -1055,19 +1038,6 @@ if [ -n "$ACT" ]; then
           ''|*[!A-Za-z0-9_.-]* ) MSG="معرّف غير صالح."; CLS=err ;;
           * ) MSG=$(run user-del "$U"); CLS=ok ;;
         esac ;;
-      authon)
-        AU=$(dec "$(arg auser)"); AP=$(dec "$(arg apass)")
-        [ -n "$AU" ] || AU=admin
-        case "$AU" in
-          *[!A-Za-z0-9_.-]*) MSG="اسم المستخدم: حروف وأرقام و . _ - فقط."; CLS=err ;;
-          *) case "$AP" in
-               '') MSG="كلمة المرور لا يمكن أن تكون فارغة."; CLS=err ;;
-               *[\'\"\\]*) MSG="كلمة المرور بلا علامات اقتباس أو شرطة خلفية."; CLS=err ;;
-               *) MSG=$(FULLTUNNEL_DEFER_RESTART=1 FULLTUNNEL_UI_USER="$AU" FULLTUNNEL_UI_PASSWORD="$AP" run auth on); CLS=ok ;;
-             esac ;;
-        esac ;;
-      authoff)
-        MSG=$(FULLTUNNEL_DEFER_RESTART=1 run auth off); CLS=ok ;;
       forget)
         if [ "$(dec "$(arg confirm)")" = FORGET ]; then
           rm -rf "$CREDS"; MSG="حُذفت بيانات Cloudflare المحفوظة."; CLS=ok
@@ -1091,8 +1061,7 @@ fi
 EPATH=$(printf '%s' "$PATHV" | sed 's|/|%2F|g')
 [ -s "$CREDS/api-token" ] && CRED=محفوظة || CRED="غير محفوظة"
 
-printf 'Content-Type: text/html; charset=utf-8\r\n'
-printf 'Cache-Control: no-store, must-revalidate\r\n\r\n'
+printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
 cat <<HTML
 <!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1123,7 +1092,6 @@ input{padding:8px;border-radius:6px;border:1px solid #444;background:#0d0d0d;col
 .warn{color:#ff9a9a}
 </style><div class="c">
 <h1>XE3000 Cloudflare Full-Tunnel</h1>
-<p class="uid">اللوحة: @PANELVER@</p>
 HTML
 [ -n "$MSG" ] && { printf '<div class="%s">' "$CLS"; printf '%s' "$MSG" | esc; printf '</div>'; }
 
@@ -1182,27 +1150,6 @@ cat <<'HTML'
 <p>ملفا الخدمة يُنشآن في الخطوة [4/6]. غيابهما يعني أن التثبيت توقف قبلها.</p>
 <p><a class="btn" href="setup.cgi">افتح صفحة الإعداد</a></p>
 <p>أو على الراوتر: <code>sh /root/xe3000autouiinput.sh install</code></p></div>
-HTML
-fi
-
-if [ -s "$BASE/ui/httpd.conf" ]; then
-  AUTHU=$(cut -d: -f2 "$BASE/ui/httpd.conf" 2>/dev/null)
-  cat <<HTML
-<div class="card"><h2>حماية اللوحة</h2>
-<p>مفعّلة — المستخدم <b>$AUTHU</b></p>
-<form method="post"><input type="hidden" name="action" value="authoff">
-<button class="del">تعطيل الحماية</button></form></div>
-HTML
-else
-  cat <<'HTML'
-<div class="card"><h2>حماية اللوحة</h2>
-<p class="warn">معطّلة — أي جهاز على شبكتك المحلية يفتح هذه اللوحة ويرى الروابط.</p>
-<form method="post">
-  <input type="hidden" name="action" value="authon">
-  <p><input name="auser" placeholder="اسم المستخدم" value="admin" size="16"></p>
-  <p><input name="apass" type="password" placeholder="كلمة المرور" size="16"></p>
-  <button>تفعيل الحماية</button>
-</form></div>
 HTML
 fi
 
@@ -1315,7 +1262,6 @@ printf '<p><a href="control.cgi">لوحة التحكم</a></p></div>'
 UISETUP
     sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/setup.cgi"
     sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/control.cgi"
-    sed -i "s#@PANELVER@#$VERSION ($(date -u '+%Y-%m-%d %H:%M')Z)#" "$UIROOT/cgi-bin/control.cgi"
     write_qrlib
     awk -v f="$UIROOT/qr.js" '/@QRLIB@/{while((getline l < f)>0) print l; next} {print}' \
         "$UIROOT/cgi-bin/control.cgi" >"$UIROOT/cgi-bin/control.cgi.new" &&
@@ -1326,11 +1272,10 @@ UISETUP
 }
 
 set_password() { # $1 = enabled flag
-    _enabled=${1:-0}
+    _enabled=${1:-1}
     if [ "$_enabled" = 0 ]; then
         rm -f "$UIROOT/httpd.conf"
-        say "اللوحة بلا كلمة مرور (محلية فقط). لتفعيلها: زر الحماية في الصفحة"
-        say "أو: sh $SELF auth on"
+        warn "المصادقة معطّلة بطلبك (auth.enabled=0) — اللوحة بلا كلمة مرور."
         return 0
     fi
     _user=${FULLTUNNEL_UI_USER:-admin}
@@ -1401,21 +1346,16 @@ configure_uhttpd() {
     uci -q delete uhttpd.xe3000
     uci set uhttpd.xe3000=uhttpd
     uci set uhttpd.xe3000.home="$UIROOT"
-    # المخططان يعملان معًا: 9000 عبر HTTP و9443 عبر HTTPS، بلا تحويل قسري
+    # uhttpd لا يجمع HTTP وHTTPS على منفذ واحد: 9000 مدخل HTTP يحوّل إلى HTTPS
     uci add_list uhttpd.xe3000.listen_http="$_ip:$UI_PORT"
     uci add_list uhttpd.xe3000.listen_https="$_ip:$UI_PORT_S"
-    uci set uhttpd.xe3000.redirect_https=0
+    uci set uhttpd.xe3000.redirect_https=1
     uci set uhttpd.xe3000.cert=/etc/uhttpd.crt
     uci set uhttpd.xe3000.key=/etc/uhttpd.key
     uci set uhttpd.xe3000.cgi_prefix=/cgi-bin
     uci set uhttpd.xe3000.rfc1918_filter=1
     uci add_list uhttpd.xe3000.index_page=index.html
-    # بلا ملف حماية: احذف الخيار كي لا يشير إلى ملف محذوف بعد تعطيل الحماية
-    if [ -s "$UIROOT/httpd.conf" ]; then
-        uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
-    else
-        uci -q delete uhttpd.xe3000.config
-    fi
+    [ -f "$UIROOT/httpd.conf" ] && uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
     uci commit uhttpd
 
     # فتح المنفذ على شبكة LAN فقط — بعض صور GL.iNet ترفض المدخلات غير المصرّح بها
@@ -1437,12 +1377,8 @@ configure_uhttpd() {
     /etc/init.d/uhttpd restart >/dev/null 2>&1 || die "تعذر إعادة تشغيل uhttpd"
     sleep 1
     if netstat -ltn 2>/dev/null | grep -q "$_ip:$UI_PORT_S "; then
-        ok "اللوحة على http://$_ip:$UI_PORT/  و  https://$_ip:$UI_PORT_S/"
-        if [ -s "$UIROOT/httpd.conf" ]; then
-            say "الحماية مفعّلة — ستُطلب بيانات الدخول."
-        else
-            say "بلا اسم مستخدم أو كلمة مرور — فعّلها من زر «حماية اللوحة» في الصفحة."
-        fi
+        ok "اللوحة على https://$_ip:$UI_PORT_S/cgi-bin/control.cgi"
+        ok "و http://$_ip:$UI_PORT/ يحوّل إليها تلقائيًا"
     else
         warn "uhttpd أُعيد تشغيله لكن المنفذ $UI_PORT لا يستمع — شغّل: sh $SELF diagnose"
     fi
@@ -1450,7 +1386,7 @@ configure_uhttpd() {
 
 install_ui() {
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
     configure_uhttpd
 }
 
@@ -1461,7 +1397,7 @@ installed_partial()  { [ -d "$BASE" ] && ! installed_complete; }
 do_install() {
     need_root
     if installed_complete; then
-        die "يوجد تثبيت مكتمل. للترقية بلا مساس بالإعدادات: sh $SELF upgrade"
+        die "يوجد تثبيت مكتمل. استخدم: sh $SELF status"
     fi
     if installed_partial; then
         die "توجد بقايا تثبيت ناقص. نظّفها أولًا: sh $SELF reset"
@@ -1497,68 +1433,6 @@ do_install() {
     return 0
 }
 
-# ترقية في المكان: كل شيء يُعاد بناؤه من الإعدادات المحفوظة كما هي.
-# لا يُلمس settings.env ولا users.tsv ولا بيانات الاعتماد ولا Cloudflare،
-# فالمسار والمنفذ والمعرّفات تبقى كما هي وروابط العملاء لا تتغيّر.
-do_upgrade() {
-    need_root
-    installed_complete || die "لا يوجد تثبيت مكتمل لترقيته. استخدم: sh $SELF auto"
-    load_settings || die "ملف الإعدادات مفقود: $SETTINGS"
-    [ -n "$CF_HOSTNAME" ] || die "الإعدادات المحفوظة بلا اسم مضيف — لا أرقّي فوق إعداد ناقص."
-    [ -n "$TUNNEL_ID" ]   || die "الإعدادات المحفوظة بلا معرّف نفق — لا أرقّي فوق إعداد ناقص."
-    [ -f "$BASE/tunnel/$TUNNEL_ID.json" ] || die "ملف اعتماد النفق مفقود: $BASE/tunnel/$TUNNEL_ID.json"
-
-    # بصمة ما يجب ألا يتغيّر
-    _keep=$(cat "$SETTINGS"; cat "$USERS" 2>/dev/null)
-
-    say "ترقية في المكان — الإعدادات المثبّتة تُستعمل كما هي:"
-    say "  المضيف   : $(mask "$CF_HOSTNAME")"
-    say "  النفق    : $(mask "$TUNNEL_ID")"
-    say "  المسار   : $(mask "$XRAY_WSPATH")"
-    say "  الناقل   : ${XRAY_NET:-ws}/${XRAY_PROTO:-vless}   المنفذ: ${XRAY_PORT:-?}"
-    say "  المستخدمون: $(users_count) — معرّفاتهم لا تتغيّر، والروابط تبقى صالحة."
-    say ""
-
-    if have cloudflared && have xray; then
-        ok "cloudflared وxray موجودان — بلا تنزيل"
-    else
-        say "ينقص ملف تنفيذي — تثبيت الاعتمادات."
-        prepare_runtime
-    fi
-
-    say "إعادة كتابة الملفات المولَّدة…"
-    write_cfd_config
-    write_xray_config
-    write_init
-    ok "أُعيدت كتابة إعداد xray وcloudflared وملفي الخدمة"
-
-    # ملحقات اختيارية: تُحدَّث فقط إن كانت مفعّلة أصلًا
-    [ -f "$BASE/watchdog.sh" ] && { write_watchdog; ok "حُدِّث ملف المراقبة"; }
-    if uci -q get firewall.xe3000_inc >/dev/null 2>&1; then
-        write_fwinclude
-        sh "$BASE/firewall.sh" 2>/dev/null
-        ok "حُدِّث تجاوز كِل‑سويتش VPN"
-    fi
-
-    enable_services
-    # اللوحة آخر خطوة وأقلها أهمية: شهادة HTTPS مفقودة تُنهي configure_uhttpd
-    # بـ die، ولا يصح أن تُسقط ترقية نجحت. لذا في صدفة فرعية.
-    write_ui_files
-    ( configure_uhttpd ) || warn "تعذر ضبط لوحة $UI_PORT — شغّل: sh $SELF diagnose"
-    install_launchers       # بلا set_password: حماية اللوحة تبقى كما ضبطتها
-
-    if [ "$_keep" = "$(cat "$SETTINGS"; cat "$USERS" 2>/dev/null)" ]; then
-        ok "الإعدادات والمستخدمون لم يتغيّروا بايتًا واحدًا"
-    else
-        warn "تغيّر ملف الإعدادات أو المستخدمين أثناء الترقية — راجع: sh $SELF links"
-    fi
-
-    say ""
-    ok "اكتملت الترقية — الإصدار الآن $VERSION"
-    do_selftest || warn "الترقية تمت لكن فحص السلسلة لم يمرّ — شغّل: sh $SELF doctor"
-    return 0
-}
-
 show_client() {
     say ""
     say "بيانات العميل (VLESS + WebSocket عبر Cloudflare):"
@@ -1575,7 +1449,7 @@ show_client() {
     done <"$USERS"
     say ""
     show_ssh
-    say "لرمز QR ونسخ الروابط بضغطة: http://$(lan_ip):$UI_PORT/  أو  https://$(lan_ip):$UI_PORT_S/"
+    say "لرمز QR ونسخ الروابط بضغطة: https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi"
 }
 
 do_status() {
@@ -1585,8 +1459,8 @@ do_status() {
         return 1
     fi
     say "الإصدار    : $VERSION"
-    say "المضيف     : $(mask "$CF_HOSTNAME")"
-    say "النفق      : $(mask "$TUNNEL_NAME") ($(mask "$TUNNEL_ID"))"
+    say "المضيف     : $CF_HOSTNAME"
+    say "النفق      : $TUNNEL_NAME ($TUNNEL_ID)"
     for s in xe3000-cf-xray xe3000-cf-tunnel; do
         if [ -x /etc/init.d/$s ] && /etc/init.d/$s running >/dev/null 2>&1; then
             say "$s : يعمل"
@@ -1707,19 +1581,18 @@ do_repair_ui() {
 do_bootstrap() {
     need_root
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
     configure_uhttpd
-    ok "افتح http://$(lan_ip):$UI_PORT/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
-    say "أو عبر HTTPS: https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi"
+    ok "افتح https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
 }
 
 # لا وسائط: يقرر وحده
 do_auto_self() {
     need_root
     if installed_complete; then
-        say "بوابة مكتملة — ترقية في المكان بالإعدادات المثبّتة."
-        do_upgrade
-        return $?
+        say "بوابة مكتملة — إصلاح لوحة $UI_PORT فقط."
+        FULLTUNNEL_RESTORE_UI=1 do_repair_ui
+        return 0
     fi
     if installed_partial; then
         say "بقايا تثبيت فاشل — تنظيف تلقائي."
@@ -1765,55 +1638,34 @@ do_set_token() {
 # ----------------------------------------------------------------- قائمة SSH
 menu_pause() { read_tty "اضغط Enter للمتابعة… " _x; }
 
-# كل إجراء في صدفة فرعية: أي die داخله لا يُنهي القائمة.
-act() { ( "$@" ) || true; }
-
-svc_state() {
-    [ -x "/etc/init.d/$1" ] || { printf 'غير مثبت'; return 0; }
-    /etc/init.d/"$1" running >/dev/null 2>&1 && printf 'يعمل' || printf 'متوقف'
-}
-
-watchdog_state() {
-    if grep -q 'xe3000-cf-fulltunnel/watchdog.sh' /etc/crontabs/root 2>/dev/null; then
-        _wm=$(sed -n 's#^\*/\([0-9]*\) .*watchdog.sh#\1#p' /etc/crontabs/root 2>/dev/null | head -1)
-        printf 'مفعّلة (كل %s د)' "${_wm:-?}"
-    else
-        printf 'معطّلة'
-    fi
-}
-
-auth_state() { [ -s "$UIROOT/httpd.conf" ] && printf 'مفعّلة' || printf 'معطّلة'; }
-
 do_menu() {
     has_tty || die "الأمر menu تفاعلي — شغّله من جلسة SSH."
     while : ; do
         printf '\n'
-        say "══════════ XE3000 Full-Tunnel ══════════"
+        say "══════ XE3000 Full-Tunnel ══════"
         if load_settings 2>/dev/null; then
-            say "  المضيف: $(mask "$CF_HOSTNAME")    المستخدمون: $(users_count)"
-            say "  الناقل: ${XRAY_NET:-ws}/${XRAY_PROTO:-vless}   الاستماع: $(mask "$XRAY_LISTEN")"
-            say "  xray: $(svc_state xe3000-cf-xray)   cloudflared: $(svc_state xe3000-cf-tunnel)"
-            say "  المراقبة: $(watchdog_state)   الحماية: $(auth_state)"
+            say "  المضيف: $CF_HOSTNAME    المستخدمون: $(users_count)"
+            say "  xray: $(/etc/init.d/xe3000-cf-xray running >/dev/null 2>&1 && echo يعمل || echo متوقف)   cloudflared: $(/etc/init.d/xe3000-cf-tunnel running >/dev/null 2>&1 && echo يعمل || echo متوقف)"
         else
             say "  غير مثبت"
         fi
-        say "────────────────────────────────────────"
-        say "  1) الحالة              2) المستخدمون"
-        say "  3) الروابط             4) تشغيل/إيقاف/إعادة"
-        say "  5) فحص السلسلة         6) الصيانة الذاتية"
-        say "  7) الإعدادات           8) حماية اللوحة"
-        say "  9) تثبيت/ترقية         0) خروج"
+        say "────────────────────────────────"
+        say "  1) الحالة            2) المستخدمون"
+        say "  3) الروابط           4) تشغيل/إيقاف/إعادة"
+        say "  5) تشخيص             6) تبديل التوكن"
+        say "  7) كلمة مرور اللوحة  8) لوحة 9000"
+        say "  9) تثبيت/إكمال       0) خروج"
         read_tty "الاختيار: " _c
         case "$_c" in
-            1) act do_status ;;
+            1) do_status ;;
             2) menu_users ;;
-            3) act users_links ;;
+            3) users_links ;;
             4) menu_services ;;
-            5) act do_selftest ;;
-            6) menu_maint ;;
-            7) menu_settings ;;
-            8) menu_auth ;;
-            9) act do_auto_self ;;
+            5) do_diagnose; say ""; do_selftest || true ;;
+            6) do_set_token || true ;;
+            7) need_root; set_password 1 && configure_uhttpd ;;
+            8) say "https://$(lan_ip):$UI_PORT_S/cgi-bin/control.cgi  (أو http://$(lan_ip):$UI_PORT/)" ;;
+            9) do_auto_self || true ;;
             0|q|Q) return 0 ;;
             *) warn "اختيار غير معروف." ;;
         esac
@@ -1821,7 +1673,6 @@ do_menu() {
     done
 }
 
-# ── المستخدمون ──
 menu_users() {
     while : ; do
         printf '\n'
@@ -1831,102 +1682,15 @@ menu_users() {
         read_tty "الاختيار: " _c
         case "$_c" in
             a|A) read_tty "الاسم (فارغ = تلقائي): " _n
-                 ( user_add "$_n" >/dev/null && users_apply ) || true ;;
+                 user_add "$_n" >/dev/null && users_apply ;;
             d|D) read_tty "الاسم أو المعرّف للحذف: " _k
                  [ "$(users_count)" -gt 1 ] || { warn "لا يمكن حذف آخر مستخدم."; continue; }
-                 ( user_del "$_k" && users_apply ) || true ;;
-            r|R) act users_apply ;;
+                 user_del "$_k" && users_apply ;;
+            r|R) users_apply ;;
             b|B|'') return 0 ;;
             *) warn "اختيار غير معروف." ;;
         esac
     done
-}
-
-# ── الصيانة الذاتية ──
-menu_maint() {
-    while : ; do
-        printf '\n'
-        say "── الصيانة الذاتية ──"
-        say "  المراقبة الآن: $(watchdog_state)"
-        say "  1) إصلاح ذاتي الآن (doctor)"
-        say "  2) ابحث عن إعداد يعمل (autotune)"
-        say "  3) تحديث السكربت (selfupdate)"
-        say "  4) المراقبة الدورية: تفعيل"
-        say "  5) المراقبة الدورية: تعطيل"
-        say "  6) تجربة المراقبة مرة واحدة"
-        say "  b) رجوع"
-        read_tty "الاختيار: " _c
-        case "$_c" in
-            1) act do_doctor ;;
-            2) act do_autotune ;;
-            3) act do_selfupdate; return 0 ;;
-            4) read_tty "كل كم دقيقة؟ [5]: " _m; [ -n "$_m" ] || _m=5
-               act do_watchdog on "$_m" ;;
-            5) act do_watchdog off ;;
-            6) act do_watchdog test ;;
-            b|B|'') return 0 ;;
-            *) warn "اختيار غير معروف." ;;
-        esac
-        menu_pause
-    done
-}
-
-# ── الإعدادات ──
-menu_settings() {
-    while : ; do
-        load_settings 2>/dev/null
-        printf '\n'
-        say "── الإعدادات ──"
-        say "  الناقل: ${XRAY_NET:-ws}   البروتوكول: ${XRAY_PROTO:-vless}"
-        say "  الاستماع: $(mask "$XRAY_LISTEN")   المنفذ: ${XRAY_PORT:-?}"
-        say "  جسر SSH: $([ "${SSHWS:-0}" = 1 ] && echo مفعّل || echo معطّل)"
-        say "   1) الناقل ws            2) الناقل xhttp"
-        say "   3) البروتوكول vless     4) البروتوكول trojan"
-        say "   5) الاستماع 127.0.0.1   6) الاستماع على LAN"
-        say "   7) الاستماع مقبس Unix   8) تبديل المنفذ"
-        say "   9) جسر SSH تفعيل       10) جسر SSH تعطيل"
-        say "  11) تجاوز كِل-سويتش VPN  12) إلغاء التجاوز"
-        say "  13) تبديل توكن Cloudflare"
-        say "   b) رجوع"
-        read_tty "الاختيار: " _c
-        case "$_c" in
-            1)  act do_set_transport ws ;;
-            2)  act do_set_transport xhttp ;;
-            3)  act do_set_protocol vless ;;
-            4)  act do_set_protocol trojan ;;
-            5)  act do_set_listen 127.0.0.1 ;;
-            6)  act do_set_listen "$(lan_ip)" ;;
-            7)  act do_set_listen unix ;;
-            8)  read_tty "المنفذ الجديد: " _p; act do_set_port "$_p" ;;
-            9)  act do_sshws on ;;
-            10) act do_sshws off ;;
-            11) act do_vpn_bypass on ;;
-            12) act do_vpn_bypass off ;;
-            13) act do_set_token ;;
-            b|B|'') return 0 ;;
-            *) warn "اختيار غير معروف." ;;
-        esac
-        menu_pause
-    done
-}
-
-# ── حماية اللوحة ──
-menu_auth() {
-    printf '\n'
-    say "── حماية اللوحة ──  الحالة: $(auth_state)"
-    say "  1) تفعيل باسم وكلمة مرور"
-    say "  2) تعطيل"
-    say "  3) العنوان"
-    say "  b) رجوع"
-    read_tty "الاختيار: " _c
-    case "$_c" in
-        1) read_tty "اسم المستخدم [admin]: " _u; [ -n "$_u" ] || _u=admin
-           read_tty "كلمة المرور: " _p 1
-           ( FULLTUNNEL_UI_USER="$_u" FULLTUNNEL_UI_PASSWORD="$_p" do_auth on ) || true ;;
-        2) act do_auth off ;;
-        3) say "http://$(lan_ip):$UI_PORT/   و   https://$(lan_ip):$UI_PORT_S/" ;;
-        *) : ;;
-    esac
 }
 
 menu_services() {
@@ -2009,8 +1773,6 @@ check_offload() {
 }
 
 do_selftest() {
-    [ "${FULLTUNNEL_SHOW_SECRETS:-0}" = 1 ] ||
-        say "(القيم المعرِّفة مخفية — FULLTUNNEL_SHOW_SECRETS=1 لإظهارها)"
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
     _fail=0
@@ -2052,8 +1814,8 @@ do_selftest() {
         _cpr=$(jf "$_j" '@.inbounds[0].protocol')
         say "    protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
         _cw=${_cw:-$(jf "$_j" '@.inbounds[0].streamSettings.xhttpSettings.path')}
-        say "    path في config.json : $(mask "$_cw")"
-        say "    path في settings.env: $(mask "$XRAY_WSPATH")"
+        say "    path في config.json : $_cw"
+        say "    path في settings.env: $XRAY_WSPATH"
         case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
         [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
         is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
@@ -2216,9 +1978,9 @@ do_selftest() {
     say ""
     say "── 5) DNS للمضيف ──"
     if nslookup "$CF_HOSTNAME" >/dev/null 2>&1; then
-        ok "$(mask "$CF_HOSTNAME") يُحوّل"
+        ok "$CF_HOSTNAME يُحوّل"
     else
-        err "$(mask "$CF_HOSTNAME") لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
+        err "$CF_HOSTNAME لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
         _fail=1
     fi
 
@@ -2229,7 +1991,7 @@ do_selftest() {
         404) ok "الحافة تصل إلى cloudflared (404 من ingress هو المتوقع للجذر)" ;;
         530) err "خطأ 530 — DNS يشير إلى النفق لكن لا اتصال نشط من cloudflared."; _fail=1 ;;
         000|curl*)
-            warn "الراوتر نفسه لم يصل إلى المضيف العام ($_e)"
+            warn "الراوتر نفسه لم يصل إلى https://$CF_HOSTNAME/ ($_e)"
             say  "    كثيرًا ما يعجز الراوتر عن طلب مضيفه العام من الداخل؛"
             say  "    جرّبه من الهاتف أو حاسوب خارج الشبكة قبل عدّه عطلًا." ;;
         *)   say "    الحافة ردّت $_e" ;;
@@ -2378,17 +2140,9 @@ _c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://\$H/" 2>/dev
 case "\$_c" in
     2*|4*) exit 0 ;;
 esac
-logger -t xe3000 "watchdog: المسار العام ردّ '\$_c' — إصلاح ذاتي ثم إعادة تشغيل"
-# الإصلاح الذاتي أولًا: قد يكون العطل معروفًا ولا يحتاج إعادة تشغيل عمياء
-sh $SELF_ABS doctor >/dev/null 2>&1
+logger -t xe3000 "watchdog: المسار العام ردّ '\$_c' — إعادة تشغيل الخدمتين"
 /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1
 /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
-sleep 5
-_c2=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://\$H/" 2>/dev/null)
-case "\$_c2" in
-    2*|4*) logger -t xe3000 "watchdog: عاد للعمل (\$_c2)" ;;
-    *)     logger -t xe3000 "watchdog: ما زال معطلًا (\$_c2)" ;;
-esac
 WDOG
     chmod 750 "$BASE/watchdog.sh"
 }
@@ -2461,196 +2215,6 @@ do_vpn_bypass() {
     esac
 }
 
-# ════════════════ الإصلاح الذاتي ════════════════
-# كل فحص يعرف عطلًا واجهناه فعلًا، ويعرف كيف يُصلحه بلا تدخّل.
-doctor_fix() { _fixed=$(( ${_fixed:-0} + 1 )); warn "أُصلح: $1"; }
-
-do_doctor() {
-    need_root
-    load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
-    _fixed=0; _left=0
-
-    # 1) ملف خدمة xray بلا GODEBUG: مستمعو Go يُفتحون بـ MPTCP فلا تكتمل المصافحة
-    if ! grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null; then
-        ( write_init >/dev/null 2>&1; enable_services >/dev/null 2>&1 ) || true
-        grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null &&
-            doctor_fix "ملف الخدمة يضبط GODEBUG=multipathtcp=0"
-    fi
-
-    # 2) TCP Fast Open: يُنتج طلبات اتصال بعناوين مصفّرة على هذه النواة
-    _f=/proc/sys/net/ipv4/tcp_fastopen
-    if [ -w "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" != 0 ]; then
-        ( disable_tfo >/dev/null 2>&1 ) || true
-        [ "$(cat "$_f" 2>/dev/null)" = 0 ] && doctor_fix "TCP Fast Open معطّل"
-    fi
-
-    # 3) نسخة uhttpd قديمة تحجز منفذ اللوحة
-    if uci -q show uhttpd 2>/dev/null | grep -q 'xe3000-fulltunnel-bootstrap'; then
-        ( drop_legacy_uhttpd >/dev/null 2>&1 ) || true
-        doctor_fix "أُزيلت نسخة uhttpd قديمة"
-    fi
-
-    # 4) اللوحة مفقودة أو بلا مولّد QR (ترقية لم تُحدّث الصفحات)
-    # كل إصلاح في صدفة فرعية: die داخل دالة مستدعاة لا يُنهي doctor
-    if [ ! -f "$UIROOT/cgi-bin/control.cgi" ] ||
-       ! grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" 2>/dev/null; then
-        ( write_ui_files >/dev/null 2>&1 ) || true
-        ( FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 ) || true
-        grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" 2>/dev/null &&
-            doctor_fix "أُعيد بناء صفحات اللوحة" ||
-            { err "تعذر بناء اللوحة — راجع: sh $SELF ui-only"; _left=$(( _left + 1 )); }
-    fi
-
-    # 5) قاعدة الجدار الناري للوحة
-    if command -v uci >/dev/null 2>&1 && ! uci -q get firewall.xe3000_panel >/dev/null 2>&1; then
-        ( FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 ) || true
-        uci -q get firewall.xe3000_panel >/dev/null 2>&1 &&
-            doctor_fix "أُعيدت قاعدة الجدار الناري للوحة"
-    fi
-
-    # 6) كِل‑سويتش VPN موجود بلا تجاوز لمرور cloudflared
-    if ip rule show 2>/dev/null | grep -q blackhole && [ ! -f "$BASE/firewall.sh" ]; then
-        ( do_vpn_bypass on >/dev/null 2>&1 ) || true
-        [ -f "$BASE/firewall.sh" ] && doctor_fix "فُعّل تجاوز كِل‑سويتش VPN"
-    fi
-
-    # 7) ناقل ws فوق مقبس Unix: cloudflared لا يمرّر الترقية إلى أصل unix
-    if is_sock && [ "${XRAY_NET:-ws}" = ws ]; then
-        err "ws فوق مقبس Unix لا يعمل — بدّل الناقل أو العنوان."
-        say "    sh $SELF set-transport xhttp   أو   sh $SELF set-listen 127.0.0.1"
-        _left=$(( _left + 1 ))
-    fi
-
-    # 8) خدمة متوقفة
-    for _s in xe3000-cf-xray xe3000-cf-tunnel; do
-        [ -x /etc/init.d/$_s ] || continue
-        /etc/init.d/$_s running >/dev/null 2>&1 ||
-            { /etc/init.d/$_s restart >/dev/null 2>&1; doctor_fix "أُعيد تشغيل $_s"; }
-    done
-
-    say ""
-    [ "$_fixed" = 0 ] && ok "لا شيء يحتاج إصلاحًا." || ok "أُصلح $_fixed بندًا."
-    [ "$_left" = 0 ] || warn "بقي $_left بندًا يحتاج قرارك."
-    return 0
-}
-
-# ════════════════ الضبط الذاتي ════════════════
-# يجرّب التركيبات الممكنة ويُبقي أول ما ينجح — بلا تدخّل.
-tune_probe() {   # ينجح إن ردّ الأصل محليًا وعبر Cloudflare
-    sleep 3
-    if is_sock; then
-        _a=$(_probe "http://localhost$XRAY_WSPATH")
-    else
-        _a=$(_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
-    fi
-    case "$_a" in *400*|*101*|*404*) : ;; *) return 1 ;; esac
-    _b=$(ws_probe "https://$CF_HOSTNAME$XRAY_WSPATH")
-    case "$_b" in *101*) return 0 ;; esac
-    # xhttp لا يستعمل الترقية: يكفي ردّ عادي من الأصل عبر الحافة
-    [ "${XRAY_NET:-ws}" = xhttp ] &&
-        { _c=$(_probe "https://$CF_HOSTNAME/"); case "$_c" in *404*|*400*) return 0 ;; esac; }
-    return 1
-}
-
-do_autotune() {
-    need_root
-    load_settings || die "لا يوجد تثبيت محلي."
-    _o_listen=$XRAY_LISTEN; _o_net=$XRAY_NET; _o_port=$XRAY_PORT
-    say "يجرّب التركيبات حتى تعمل السلسلة — قد يستغرق دقيقة."
-    for _combo in "127.0.0.1 ws" "$(lan_ip) ws" "/var/run/xe3000-xray.sock xhttp" "127.0.0.1 xhttp"; do
-        XRAY_LISTEN=${_combo%% *}; XRAY_NET=${_combo##* }
-        say ""
-        say "── تجربة: $(mask "$XRAY_LISTEN") / $XRAY_NET ──"
-        save_settings
-        users_apply >/dev/null 2>&1
-        write_cfd_config
-        /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
-        if tune_probe; then
-            ok "نجحت: $(mask "$XRAY_LISTEN") / $XRAY_NET — حُفظت."
-            users_links
-            return 0
-        fi
-        say "    لم تنجح."
-    done
-    XRAY_LISTEN=$_o_listen; XRAY_NET=$_o_net; XRAY_PORT=$_o_port
-    save_settings; users_apply >/dev/null 2>&1; write_cfd_config
-    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
-    err "لم تنجح أي تركيبة — أُعيد الإعداد السابق."
-    say "شغّل: sh $SELF selftest   وأرسل الناتج."
-    return 1
-}
-
-# ════════════════ التحديث الذاتي ════════════════
-do_selfupdate() {
-    need_root
-    need_cmd curl; need_cmd sha256sum
-    _t=/tmp/.xe3000up.$$; mkdir -p "$_t" || die "تعذر إنشاء مجلد مؤقت"
-    curl -fsSL --max-time 120 "$UPDATE_BASE/xe3000autouiinput.sh" -o "$_t/new.sh" ||
-        { rm -rf "$_t"; die "تعذر تنزيل النسخة الجديدة من $UPDATE_BASE"; }
-    curl -fsSL --max-time 60 "$UPDATE_BASE/SHA256SUMS" -o "$_t/sums" ||
-        { rm -rf "$_t"; die "تعذر تنزيل ملف البصمات"; }
-    _want=$(awk '$2=="xe3000autouiinput.sh"{print $1}' "$_t/sums")
-    _got=$(sha256sum "$_t/new.sh" | cut -d' ' -f1)
-    [ -n "$_want" ] || { rm -rf "$_t"; die "لا بصمة للسكربت في SHA256SUMS"; }
-    [ "$_want" = "$_got" ] || { rm -rf "$_t"; die "البصمة لا تطابق — أُلغي التحديث."; }
-    sh -n "$_t/new.sh" || { rm -rf "$_t"; die "النسخة الجديدة بها خطأ صياغة — أُلغي التحديث."; }
-    _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$_t/new.sh" | head -1)
-    if [ "$_nv" = "$VERSION" ]; then
-        rm -rf "$_t"; ok "أنت على أحدث نسخة ($VERSION)."; return 0
-    fi
-    cp "$SELF_ABS" "$SELF_ABS.bak" 2>/dev/null
-    cat "$_t/new.sh" >"$SELF_ABS" || { rm -rf "$_t"; die "تعذر استبدال السكربت"; }
-    chmod 755 "$SELF_ABS"; rm -rf "$_t"
-    ok "حُدّث: $VERSION ← $_nv   (نسخة احتياطية: $SELF_ABS.bak)"
-    say "يطبّق التغييرات الآن…"
-    sh "$SELF_ABS" doctor
-}
-
-# اللوحة نفسها تعمل تحت uhttpd: إعادة التشغيل الفورية تقطع ردّ CGI قبل وصوله.
-uhttpd_reload() {
-    if [ "${FULLTUNNEL_DEFER_RESTART:-0}" = 1 ]; then
-        ( sleep 2; /etc/init.d/uhttpd restart ) </dev/null >/dev/null 2>&1 &
-        return 0
-    fi
-    /etc/init.d/uhttpd restart >/dev/null 2>&1
-}
-
-do_auth() {
-    need_root
-    case "${1:-status}" in
-        on|1)
-            _u=${FULLTUNNEL_UI_USER:-admin}
-            _p=${FULLTUNNEL_UI_PASSWORD:-}
-            case "$_u" in *[!A-Za-z0-9_.-]*) die "اسم المستخدم: حروف وأرقام و . _ - فقط." ;; esac
-            if [ -z "$_p" ]; then
-                has_tty || die "مرّر FULLTUNNEL_UI_PASSWORD أو شغّله من طرفية."
-                read_tty "كلمة المرور: " _p 1
-            fi
-            [ -n "$_p" ] || die "كلمة المرور لا يمكن أن تكون فارغة."
-            case "$_p" in *[\'\"\\\\]*) die "كلمة المرور بلا علامات اقتباس أو شرطة خلفية." ;; esac
-            mkdir -p "$UIROOT"
-            printf '/:%s:%s\n' "$_u" "$(openssl passwd -1 "$_p")" >"$UIROOT/httpd.conf"
-            chmod 600 "$UIROOT/httpd.conf"
-            uci set uhttpd.xe3000.config="$UIROOT/httpd.conf" 2>/dev/null
-            uci commit uhttpd 2>/dev/null
-            uhttpd_reload
-            ok "الحماية مفعّلة للمستخدم $_u — سيطلب المتصفح الاسم وكلمة المرور بعد لحظات." ;;
-        off|0)
-            rm -f "$UIROOT/httpd.conf"
-            uci -q delete uhttpd.xe3000.config 2>/dev/null
-            uci commit uhttpd 2>/dev/null
-            uhttpd_reload
-            ok "الحماية معطّلة — اللوحة مفتوحة لشبكة LAN" ;;
-        status)
-            if [ -s "$UIROOT/httpd.conf" ]; then
-                say "الحماية: مفعّلة (المستخدم: $(cut -d: -f2 "$UIROOT/httpd.conf"))"
-            else
-                say "الحماية: معطّلة"
-            fi ;;
-        *) die "الاستعمال: auth on|off|status" ;;
-    esac
-}
-
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -2659,12 +2223,10 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF install          تثبيت يدوي من البداية
   sh $SELF auto [file]      تثبيت بلا أسئلة من ملف إعداد 600
   sh $SELF bootstrap        صفحة الإعداد العربية على LAN:$UI_PORT
-  sh $SELF upgrade          ترقية تثبيت قائم بإعداداته كما هي
   sh $SELF ui-only          إعادة تثبيت لوحة $UI_PORT
   sh $SELF status           حالة البوابة والواجهة
   sh $SELF diagnose         فحص uhttpd والمنفذ $UI_PORT
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
-  sh $SELF auth on|off|status  حماية اللوحة باسم وكلمة مرور
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
@@ -2674,9 +2236,6 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
   sh $SELF vpn-bypass on|off  تجاوز كِل‑سويتش WireGuard
-  sh $SELF doctor           يكتشف الأعطال المعروفة ويُصلحها تلقائيًا
-  sh $SELF autotune         يجرّب التركيبات ويُبقي ما ينجح
-  sh $SELF selfupdate       يحدّث نفسه بعد تحقق البصمة ثم يطبّق
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -2704,14 +2263,9 @@ case "${1:-}" in
     ui-only)            need_root; install_ui ;;
     status)             do_status ;;
     diagnose)           do_diagnose ;;
-    upgrade)            do_upgrade ;;
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
-    auth)               do_auth "${2:-status}" ;;
     set-token)          do_set_token ;;
-    doctor)             do_doctor ;;
-    autotune)           do_autotune ;;
-    selfupdate)         do_selfupdate ;;
     selftest)           do_selftest ;;
     set-listen)         do_set_listen "${2:-}" ;;
     set-transport)      do_set_transport "${2:-}" ;;
@@ -2736,17 +2290,7 @@ case "${1:-}" in
     prepare-runtime)    need_root; prepare_runtime ;;
     reinstall-services) need_root; load_settings || die "لا يوجد تثبيت محلي."
                         write_init; enable_services ;;
-    version)            say "السكربت : $VERSION"
-                        if [ -f "$SETTINGS" ]; then
-                            say "المثبَّت : $(sed -n 's/^FULLTUNNEL_VERSION=//p' "$SETTINGS")"
-                        fi
-                        if [ -f "$UIROOT/cgi-bin/control.cgi" ]; then
-                            say "اللوحة  : $(grep -o 'اللوحة: [^<]*' "$UIROOT/cgi-bin/control.cgi" | head -1 | sed 's/^اللوحة: //')"
-                            grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" &&
-                                say "          فيها مولّد QR ✓" || say "          بلا مولّد QR ✗"
-                        else
-                            say "اللوحة  : غير مثبتة"
-                        fi ;;
+    version)            say "$VERSION" ;;
     help|-h|--help)     usage ;;
     *)                  err "أمر غير معروف: $1"; usage; exit 1 ;;
 esac
