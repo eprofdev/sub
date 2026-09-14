@@ -415,35 +415,71 @@ users_apply() {
     load_settings || die "لا يوجد تثبيت محلي."
     users_init
     [ -s "$USERS" ] || die "لا يمكن ترك القائمة فارغة — أضف مستخدمًا أولًا."
-    [ -n "$XRAY_PORT" ] && [ -n "$XRAY_WSPATH" ] || die "إعداد ناقص في $SETTINGS — أعد التثبيت."
+    [ -n "$XRAY_WSPATH" ] || die "إعداد ناقص في $SETTINGS — أعد التثبيت."
+    write_xray_config
+    if [ -x /etc/init.d/xe3000-cf-xray ]; then
+        /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل xray"
+    else
+        warn "خدمة xray غير مثبتة بعد — سيُستخدم الإعداد عند اكتمال التثبيت."
+    fi
+    ok "طُبّقت القائمة ($(users_count) مستخدم)"
+}
+
+# عنوان الاستماع قد يكون IP أو مسار مقبس Unix يبدأ بـ /
+is_sock() { case "${1:-$XRAY_LISTEN}" in /*) return 0 ;; *) return 1 ;; esac; }
+
+cfd_service() {
+    if is_sock; then printf 'unix:%s' "$XRAY_LISTEN"
+    else printf 'http://%s:%s' "$XRAY_LISTEN" "$XRAY_PORT"; fi
+}
+
+write_cfd_config() {
+    mkdir -p "$CFD_DIR"
+    cat >"$CFD_DIR/config.yml" <<CFDCFG
+tunnel: $TUNNEL_ID
+credentials-file: $BASE/tunnel/$TUNNEL_ID.json
+protocol: http2
+no-autoupdate: true
+loglevel: info
+ingress:
+  - hostname: $CF_HOSTNAME
+    service: $(cfd_service)
+  - service: http_status:404
+CFDCFG
+    chmod 600 "$CFD_DIR/config.yml"
+}
+
+write_xray_config() {
     mkdir -p "$XRAY_DIR" || die "تعذر إنشاء $XRAY_DIR"
+    users_init
+    [ -s "$USERS" ] || die "لا يوجد مستخدمون."
     _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
+    if is_sock; then
+        _addr="\"listen\": \"$XRAY_LISTEN\","
+        _sock=', "sockopt": { "domainSockets": {} }'
+        rm -f "$XRAY_LISTEN"
+    else
+        _addr="\"listen\": \"$XRAY_LISTEN\", \"port\": $XRAY_PORT,"
+        _sock=
+    fi
     cat >"$XRAY_DIR/config.json.new" <<XRAYCFG
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "listen": "$XRAY_LISTEN",
-      "port": $XRAY_PORT,
+      $_addr
       "protocol": "vless",
       "settings": { "clients": [ $_clients ], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "$XRAY_WSPATH" } }
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "$XRAY_WSPATH" }$_sock }
     }
   ],
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
 XRAYCFG
-    # لا تستبدل الإعداد العامل إلا بعد التأكد من اكتمال الكتابة
-    [ -s "$XRAY_DIR/config.json.new" ] || { rm -f "$XRAY_DIR/config.json.new"; die "فشلت كتابة إعداد xray."; }
-    grep -q '"clients"' "$XRAY_DIR/config.json.new" || { rm -f "$XRAY_DIR/config.json.new"; die "إعداد xray المولَّد غير مكتمل."; }
+    [ -s "$XRAY_DIR/config.json.new" ] && grep -q '"clients"' "$XRAY_DIR/config.json.new" || {
+        rm -f "$XRAY_DIR/config.json.new"; die "فشلت كتابة إعداد xray."; }
     mv "$XRAY_DIR/config.json.new" "$XRAY_DIR/config.json" || die "تعذر تثبيت إعداد xray."
     chmod 600 "$XRAY_DIR/config.json"
-    if [ -x /etc/init.d/xe3000-cf-xray ]; then
-        /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل xray — شغّل: /etc/init.d/xe3000-cf-xray restart"
-    else
-        warn "خدمة xray غير مثبتة بعد — سيُستخدم الإعداد عند اكتمال التثبيت."
-    fi
-    ok "طُبّقت القائمة ($(users_count) مستخدم)"
 }
 
 # ----------------------------------------------------------------- [3/6] النفق و DNS
@@ -506,45 +542,8 @@ write_configs() {
     else
         XRAY_UUID=$(awk -F'\t' 'NF{print $1; exit}' "$USERS")
     fi
-    _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
-
-    cat >"$CFD_DIR/config.yml" <<CFDCFG
-tunnel: $TUNNEL_ID
-credentials-file: $BASE/tunnel/$TUNNEL_ID.json
-protocol: http2
-no-autoupdate: true
-loglevel: info
-ingress:
-  - hostname: $CF_HOSTNAME
-    service: http://$XRAY_LISTEN:$XRAY_PORT
-  - service: http_status:404
-CFDCFG
-    chmod 600 "$CFD_DIR/config.yml"
-
-    cat >"$XRAY_DIR/config.json" <<XRAYCFG
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "listen": "127.0.0.1",
-      "port": $XRAY_PORT,
-      "protocol": "vless",
-      "settings": {
-        "clients": [ $_clients ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "$XRAY_WSPATH" }
-      }
-    }
-  ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" }
-  ]
-}
-XRAYCFG
-    chmod 600 "$XRAY_DIR/config.json"
+    write_cfd_config
+    write_xray_config
     ok "كُتبت ملفات الإعداد"
 }
 
@@ -1613,13 +1612,18 @@ install_launchers() {
 # فيبتلع سطر 101 أحيانًا. نفصل التيارين ونقع على خطأ curl فقط عند غياب الرد.
 _probe() { # $1 = رابط، بقية الوسائط ترويسات
     _u=$1; shift
+    _us=
+    is_sock && _us="--unix-socket $XRAY_LISTEN"
     _pe=/tmp/.xe3000probe.$$
-    _po=$(curl -sSi --noproxy '*' --max-time 6 --http1.1 "$@" "$_u" 2>"$_pe")
+    _po=$(curl -sSi --noproxy '*' $_us --max-time 6 --http1.1 "$@" "$_u" 2>"$_pe")
     _pl=$(printf '%s' "$_po" | head -n1 | tr -d '\r')
     [ -n "$_pl" ] || _pl=$(head -n1 "$_pe" 2>/dev/null | tr -d '\r')
     rm -f "$_pe"
     printf '%s' "$_pl"
 }
+
+local_url() { if is_sock; then printf 'http://localhost%s' "$XRAY_WSPATH"
+              else printf 'http://%s:%s%s' "$XRAY_LISTEN" "$XRAY_PORT" "$XRAY_WSPATH"; fi; }
 
 ws_probe() {
     _probe "$1" \
@@ -1664,7 +1668,13 @@ do_selftest() {
 
     say ""
     say "── 2) xray يستمع محليًا ──"
-    if netstat -ltn 2>/dev/null | grep -q "$XRAY_LISTEN:$XRAY_PORT "; then
+    if is_sock; then
+        if [ -S "$XRAY_LISTEN" ]; then
+            ok "مقبس Unix موجود: $XRAY_LISTEN"
+        else
+            err "مقبس Unix مفقود: $XRAY_LISTEN — xray لم يبدأ."; _fail=1
+        fi
+    elif netstat -ltn 2>/dev/null | grep -q "$XRAY_LISTEN:$XRAY_PORT "; then
         ok "المنفذ $XRAY_PORT مفتوح على $XRAY_LISTEN"
     else
         err "المنفذ $XRAY_PORT غير مفتوح — xray لم يبدأ أو الإعداد خاطئ."
@@ -1697,12 +1707,17 @@ do_selftest() {
     # فشل بمهلة على منفذ مستمع = إسقاط حزم، لا رفض اتصال
     # nc في BusyBox لا يدعم -z ولا -w، فاستعماله هنا يعطي فشلًا كاذبًا.
     # مرحلة الاتصال في curl هي القياس الصحيح: أي ردّ HTTP أو رفض = وصلنا.
-    _t=$(curl -sS --noproxy '*' --connect-timeout 5 -o /dev/null \
-         -w 'connect=%{time_connect} code=%{http_code}' \
-         "http://$XRAY_LISTEN:$XRAY_PORT/" 2>&1)
+    if is_sock; then
+        _t=$(curl -sS --noproxy '*' --unix-socket "$XRAY_LISTEN" --connect-timeout 5 \
+             -o /dev/null -w 'code=%{http_code}' "http://localhost/" 2>&1)
+    else
+        _t=$(curl -sS --noproxy '*' --connect-timeout 5 -o /dev/null \
+             -w 'connect=%{time_connect} code=%{http_code}' \
+             "http://$XRAY_LISTEN:$XRAY_PORT/" 2>&1)
+    fi
     case "$_t" in
-        *"Connection refused"*)
-            err "الاتصال مرفوض على $XRAY_LISTEN:$XRAY_PORT — لا شيء يستمع فعلًا."
+        *"Connection refused"*|*"No such file"*)
+            err "الاتصال مرفوض على $XRAY_LISTEN — لا شيء يستمع فعلًا."
             _lo=1; _fail=1 ;;
         *"timed out"*|*"Timeout"*|*"Connection timeout"*)
             err "انتهت مهلة الاتصال بـ $XRAY_LISTEN:$XRAY_PORT رغم أن المنفذ مستمع."
@@ -1770,7 +1785,7 @@ do_selftest() {
 
     say ""
     say "── 3أ) هل يتكلم xray بروتوكول HTTP على المنفذ؟ ──"
-    _h=$(http_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
+    _h=$(http_probe "$(local_url)")
     case "$_h" in
         *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
         *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
@@ -1789,7 +1804,7 @@ do_selftest() {
     say ""
     say "── 3ب) مصافحة WebSocket محليًا ──"
     # ترقية ناجحة تُبقي الاتصال مفتوحًا، فلا يصلح %{http_code}: نقرأ سطر الحالة نفسه.
-    _l=$(ws_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
+    _l=$(ws_probe "$(local_url)")
     case "$_l" in
         *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
         curl:*) err "curl لم يصل إلى xray — $_l"; _fail=1 ;;
@@ -1875,16 +1890,22 @@ do_set_listen() {
     _a=${1:-}
     [ -n "$_a" ] || _a=$(lan_ip)
     case "$_a" in
-        0.0.0.0|::) die "رفض الربط على $_a — سيعرّض xray للإنترنت." ;;
-        *[!0-9.]*)  die "عنوان غير صالح: $_a" ;;
+        unix|socket) _a=/var/run/xe3000-xray.sock ;;
+        /*)          : ;;
+        0.0.0.0|::)  die "رفض الربط على $_a — سيعرّض xray للإنترنت." ;;
+        *[!0-9.]*)   die "عنوان غير صالح: $_a (استخدم IP أو unix)" ;;
     esac
     XRAY_LISTEN=$_a
     save_settings
     users_apply
-    sed -i "s#service: http://[^:]*:$XRAY_PORT#service: http://$XRAY_LISTEN:$XRAY_PORT#" \
-        "$CFD_DIR/config.yml" || die "تعذر تحديث إعداد cloudflared"
+    write_cfd_config
     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
-    ok "xray يستمع الآن على $XRAY_LISTEN:$XRAY_PORT وcloudflared يقصده."
+    if is_sock; then
+        ok "xray يستمع على مقبس Unix: $XRAY_LISTEN — وcloudflared يقصده عبر unix:"
+        say "هذا يتجاوز مسار TCP المحلي كليًا."
+    else
+        ok "xray يستمع الآن على $XRAY_LISTEN:$XRAY_PORT وcloudflared يقصده."
+    fi
     say "تحقق: sh $SELF selftest"
 }
 
