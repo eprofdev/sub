@@ -222,7 +222,8 @@ preflight_cloudflare() {
     case "$_r" in
         curl:*|*"Could not resolve"*|*"Connection refused"*)
             err "تعذر الوصول إلى api.cloudflare.com: $_r"
-            err "لا إنترنت أو DNS معطّل على الراوتر — جرّب: ping -c1 1.1.1.1 و nslookup api.cloudflare.com"
+            err "لا إنترنت أو DNS معطّل على الراوتر."
+            net_check
             return 1 ;;
     esac
     if cf_success "$_r"; then
@@ -726,6 +727,31 @@ set_password() { # $1 = enabled flag
     ok "ضُبطت كلمة مرور اللوحة للمستخدم $_user"
 }
 
+# مُثبّتات سابقة تركت نسخة uhttpd تحجز المنفذ، فيفشل ارتباط لوحتنا صامتًا
+drop_legacy_uhttpd() {
+    _changed=0
+    for _sec in $(uci -q show uhttpd 2>/dev/null | sed -n 's/^uhttpd\.\([^.]*\)=uhttpd$/\1/p'); do
+        [ "$_sec" = xe3000 ] && continue
+        _home=$(uci -q get "uhttpd.$_sec.home" 2>/dev/null)
+        _bind="$(uci -q get "uhttpd.$_sec.listen_https" 2>/dev/null) $(uci -q get "uhttpd.$_sec.listen_http" 2>/dev/null)"
+        case "$_home" in
+            *xe3000*)
+                uci -q delete "uhttpd.$_sec"
+                warn "أُزيلت نسخة uhttpd من مُثبّت سابق: $_sec ($_home)"
+                _changed=1; continue ;;
+        esac
+        case "$_bind" in
+            *":$UI_PORT"*)
+                uci -q delete "uhttpd.$_sec"
+                warn "أُزيلت نسخة uhttpd كانت تحجز المنفذ $UI_PORT: $_sec"
+                _changed=1 ;;
+        esac
+    done
+    [ "$_changed" = 1 ] && uci commit uhttpd
+    rm -rf /www/xe3000-fulltunnel-bootstrap 2>/dev/null
+    return 0
+}
+
 configure_uhttpd() {
     _ip=$(lan_ip)
     case "$_ip" in
@@ -734,6 +760,7 @@ configure_uhttpd() {
     [ -f /etc/uhttpd.crt ] && [ -f /etc/uhttpd.key ] || \
         die "شهادة /etc/uhttpd.crt و /etc/uhttpd.key مفقودة. فعّل HTTPS من واجهة GL.iNet."
 
+    drop_legacy_uhttpd
     uci -q delete uhttpd.xe3000
     uci set uhttpd.xe3000=uhttpd
     uci set uhttpd.xe3000.home="$UIROOT"
@@ -850,6 +877,10 @@ do_diagnose() {
     say "--- uhttpd ---"
     /etc/init.d/uhttpd status 2>&1 | head -5
     uci -q show uhttpd.xe3000 || say "لا يوجد قسم uhttpd.xe3000"
+    say "--- كل نسخ uhttpd ---"
+    for _s in $(uci -q show uhttpd 2>/dev/null | sed -n 's/^uhttpd\.\([^.]*\)=uhttpd$/\1/p'); do
+        say "  $_s  home=$(uci -q get "uhttpd.$_s.home")  https=$(uci -q get "uhttpd.$_s.listen_https")"
+    done
     say "--- المنفذ $UI_PORT ---"
     netstat -ltn 2>/dev/null | grep ":$UI_PORT " || say "المنفذ $UI_PORT لا يستمع"
     say "--- عملية uhttpd ---"
@@ -864,6 +895,42 @@ do_diagnose() {
     for c in curl jsonfilter xray cloudflared openssl uci; do
         have "$c" && say "$c: $(command -v $c)" || say "$c: مفقود"
     done
+    net_check
+}
+
+# فشل DNS هو أشيع سبب لسقوط [3/6] بعد أن تصبح البيانات سليمة
+net_check() {
+    say "--- الشبكة ---"
+    if ping -c2 -W3 1.1.1.1 >/dev/null 2>&1; then
+        ok "اتصال IP يعمل (1.1.1.1)"
+    else
+        err "لا اتصال IP — راجع WAN قبل أي شيء آخر."
+        return 1
+    fi
+
+    say "resolv.conf: $(sed -n 's/^nameserver //p' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+
+    if nslookup api.cloudflare.com >/dev/null 2>&1; then
+        ok "DNS يحوّل api.cloudflare.com"
+    elif nslookup api.cloudflare.com 1.1.1.1 >/dev/null 2>&1; then
+        err "المُحلِّل المحلي معطّل: 1.1.1.1 يحوّل الاسم لكن الراوتر لا يفعل."
+        say "    العلاج:"
+        say "      uci set network.wan.peerdns='0'"
+        say "      uci add_list network.wan.dns='1.1.1.1'"
+        say "      uci add_list network.wan.dns='8.8.8.8'"
+        say "      uci commit network && /etc/init.d/network restart"
+        return 1
+    else
+        err "لا DNS إطلاقًا — حتى الاستعلام المباشر من 1.1.1.1 يفشل."
+        say "    تحقق من dnsmasq: /etc/init.d/dnsmasq status ثم logread -e dnsmasq"
+        return 1
+    fi
+
+    if curl -sS --max-time 15 -o /dev/null -w '' https://api.cloudflare.com/client/v4/ 2>/dev/null; then
+        ok "الوصول إلى api.cloudflare.com يعمل"
+    else
+        warn "DNS يعمل لكن الاتصال بـ api.cloudflare.com فشل — تحقق من ساعة الراوتر (TLS): date"
+    fi
 }
 
 do_reset() {
@@ -878,6 +945,7 @@ do_reset() {
     fi
     rm -rf "$BASE"
     rm -f /etc/init.d/xe3000-cf-xray /etc/init.d/xe3000-cf-tunnel
+    drop_legacy_uhttpd
     uci -q delete uhttpd.xe3000 && uci commit uhttpd
     /etc/init.d/uhttpd reload >/dev/null 2>&1
     ok "حُذفت بقايا التثبيت. البيانات المحفوظة في $CREDS لم تُمس."
@@ -889,6 +957,7 @@ do_remove() {
         [ -x /etc/init.d/$s ] && { /etc/init.d/$s stop >/dev/null 2>&1; /etc/init.d/$s disable >/dev/null 2>&1; }
         rm -f /etc/init.d/$s
     done
+    drop_legacy_uhttpd
     uci -q delete uhttpd.xe3000 && uci commit uhttpd
     uci -q delete firewall.xe3000_panel && uci commit firewall
     /etc/init.d/firewall reload >/dev/null 2>&1
