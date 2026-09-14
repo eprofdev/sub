@@ -1631,6 +1631,23 @@ ws_probe() {
 # الاتصال الذي تسببه ترقية ناجحة.
 http_probe() { _probe "$1"; }
 
+# تسريع NAT في MediaTek يتلف عناوين الحزم المحلية: SYN-ACK يخرج بعنوان 0.0.0.0
+# فيردّ العميل RST وتنتهي المهلة. المنفذ يبدو مستمعًا والجدار الناري نظيفًا.
+check_offload() {
+    _h1=$(uci -q get mtkhnat.global.enable)
+    _h2=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+    _h3=$(uci -q get firewall.@defaults[0].flow_offloading)
+    if [ "$_h1" = 1 ] || [ "$_h2" = 1 ] || [ "$_h3" = 1 ]; then
+        err "    تسريع NAT مفعّل (mtkhnat=$_h1 hw=$_h2 sw=$_h3) — سبب معروف لهذا العطل."
+        say "        يتلف عناوين الحزم المحلية فلا تكتمل المصافحة. للتعطيل:"
+        say "          uci set mtkhnat.global.enable='0'"
+        say "          uci -q set firewall.@defaults[0].flow_offloading='0'"
+        say "          uci -q set firewall.@defaults[0].flow_offloading_hw='0'"
+        say "          uci commit mtkhnat; uci commit firewall; /etc/init.d/firewall restart"
+        say "        ثم أعد المحاولة، وإن بقي العطل أعد تشغيل الراوتر."
+    fi
+}
+
 do_selftest() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
@@ -1689,8 +1706,8 @@ do_selftest() {
             _lo=1; _fail=1 ;;
         *"timed out"*|*"Timeout"*|*"Connection timeout"*)
             err "انتهت مهلة الاتصال بـ $XRAY_LISTEN:$XRAY_PORT رغم أن المنفذ مستمع."
-            say "    SYN يصل ولا يعود SYN-ACK: المقبس لا يقبل الاتصالات"
-            say "    (طابور ممتلئ أو عملية عالقة) — ليس جدارًا ناريًا."
+            check_offload
+            say "    SYN يخرج ولا تكتمل المصافحة — المقبس يستمع لكن الردّ لا يصل سليمًا."
             # ضابط: خادم الويب المحلي يفصل بين عطل عام في loopback وعطل في xray
             _ctl=$(curl -sS --noproxy '*' --connect-timeout 4 -o /dev/null \
                    -w '%{http_code}' "http://127.0.0.1:80/" 2>&1)
