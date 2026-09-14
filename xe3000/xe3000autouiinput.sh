@@ -338,6 +338,15 @@ USERS=$STATE/users.tsv     # سطر لكل مستخدم: uuid<TAB>الاسم
 users_init() {
     mkdir -p "$STATE"
     [ -f "$USERS" ] || { : >"$USERS"; chmod 600 "$USERS"; }
+    # ترقية تثبيت سابق لميزة تعدّد المستخدمين: المعرّف الوحيد كان في settings.env
+    if [ ! -s "$USERS" ] && [ -f "$SETTINGS" ]; then
+        _mu=$(sed -n 's/^FULLTUNNEL_XRAY_UUID=//p' "$SETTINGS" | head -1)
+        if [ -n "$_mu" ]; then
+            printf '%s\t%s\n' "$_mu" "${FULLTUNNEL_USER:-user1}" >"$USERS"
+            chmod 600 "$USERS"
+            ok "رُحِّل المستخدم الموجود من settings.env — معرّفه لم يتغيّر."
+        fi
+    fi
 }
 
 users_count() { users_init; awk 'NF{n++} END{print n+0}' "$USERS" 2>/dev/null || echo 0; }
