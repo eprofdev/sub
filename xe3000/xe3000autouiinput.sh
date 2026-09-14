@@ -1689,6 +1689,13 @@ do_selftest() {
         iptables -L OUTPUT -n -v --line-numbers 2>/dev/null | head -25 || say "    (iptables غير متاح)"
         say "    ── OUTPUT (mangle) ──"
         iptables -t mangle -L OUTPUT -n -v --line-numbers 2>/dev/null | head -20
+        say "    ── mangle: السلاسل الفرعية بعدّاداتها ──"
+        for _ch in $(iptables -t mangle -S 2>/dev/null | sed -n 's/^-N //p'); do
+            iptables -t mangle -L "$_ch" -n -v --line-numbers 2>/dev/null | head -12
+        done
+        say "    ── raw/nat OUTPUT ──"
+        iptables -t raw -L OUTPUT -n -v --line-numbers 2>/dev/null | head -8
+        iptables -t nat -L OUTPUT -n -v --line-numbers 2>/dev/null | head -12
         say "    ── سلاسل السياسة ──"
         iptables -S 2>/dev/null | grep -E '^-A (OUTPUT|policy_|.*_output)' | head -25
         say "    ── قواعد تخص المنفذ $XRAY_PORT ──"
