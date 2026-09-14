@@ -600,14 +600,16 @@ write_configs() {
         "$CF_ACCOUNT" "$TUNNEL_ID" "$TUNNEL_SECRET" >"$BASE/tunnel/$TUNNEL_ID.json"
     chmod 600 "$BASE/tunnel/$TUNNEL_ID.json"
 
-    XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
-    XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
-    XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
-    XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
-    SSHWS=${FULLTUNNEL_SSHWS:-0}
-    SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}
+    # قيمة محمّلة من إعداد قائم تسبق البيئة، والبيئة تسبق الافتراضي:
+    # هكذا لا يتولّد مسار ولا منفذ جديد فوق تثبيت موجود فتنكسر روابط العملاء.
+    XRAY_PORT=${XRAY_PORT:-${FULLTUNNEL_XRAY_PORT:-18443}}
+    XRAY_LISTEN=${XRAY_LISTEN:-${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}}
+    XRAY_NET=${XRAY_NET:-${FULLTUNNEL_XRAY_NET:-ws}}
+    XRAY_PROTO=${XRAY_PROTO:-${FULLTUNNEL_PROTO:-vless}}
+    SSHWS=${SSHWS:-${FULLTUNNEL_SSHWS:-0}}
+    SSH_PATH=${SSH_PATH:-${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}}
     SSH_PORT=$(( XRAY_PORT + 1 ))
-    XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
+    XRAY_WSPATH=${XRAY_WSPATH:-${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}}
     users_init
     if [ ! -s "$USERS" ]; then
         XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}
@@ -1459,7 +1461,7 @@ installed_partial()  { [ -d "$BASE" ] && ! installed_complete; }
 do_install() {
     need_root
     if installed_complete; then
-        die "يوجد تثبيت مكتمل. استخدم: sh $SELF status"
+        die "يوجد تثبيت مكتمل. للترقية بلا مساس بالإعدادات: sh $SELF upgrade"
     fi
     if installed_partial; then
         die "توجد بقايا تثبيت ناقص. نظّفها أولًا: sh $SELF reset"
@@ -1492,6 +1494,68 @@ do_install() {
     ok "اكتمل التثبيت."
     show_client
     [ -n "${AUTO_ENV_FILE:-}" ] && { rm -f "$AUTO_ENV_FILE"; ok "حُذف ملف الإعداد $AUTO_ENV_FILE بعد النجاح."; }
+    return 0
+}
+
+# ترقية في المكان: كل شيء يُعاد بناؤه من الإعدادات المحفوظة كما هي.
+# لا يُلمس settings.env ولا users.tsv ولا بيانات الاعتماد ولا Cloudflare،
+# فالمسار والمنفذ والمعرّفات تبقى كما هي وروابط العملاء لا تتغيّر.
+do_upgrade() {
+    need_root
+    installed_complete || die "لا يوجد تثبيت مكتمل لترقيته. استخدم: sh $SELF auto"
+    load_settings || die "ملف الإعدادات مفقود: $SETTINGS"
+    [ -n "$CF_HOSTNAME" ] || die "الإعدادات المحفوظة بلا اسم مضيف — لا أرقّي فوق إعداد ناقص."
+    [ -n "$TUNNEL_ID" ]   || die "الإعدادات المحفوظة بلا معرّف نفق — لا أرقّي فوق إعداد ناقص."
+    [ -f "$BASE/tunnel/$TUNNEL_ID.json" ] || die "ملف اعتماد النفق مفقود: $BASE/tunnel/$TUNNEL_ID.json"
+
+    # بصمة ما يجب ألا يتغيّر
+    _keep=$(cat "$SETTINGS"; cat "$USERS" 2>/dev/null)
+
+    say "ترقية في المكان — الإعدادات المثبّتة تُستعمل كما هي:"
+    say "  المضيف   : $(mask "$CF_HOSTNAME")"
+    say "  النفق    : $(mask "$TUNNEL_ID")"
+    say "  المسار   : $(mask "$XRAY_WSPATH")"
+    say "  الناقل   : ${XRAY_NET:-ws}/${XRAY_PROTO:-vless}   المنفذ: ${XRAY_PORT:-?}"
+    say "  المستخدمون: $(users_count) — معرّفاتهم لا تتغيّر، والروابط تبقى صالحة."
+    say ""
+
+    if have cloudflared && have xray; then
+        ok "cloudflared وxray موجودان — بلا تنزيل"
+    else
+        say "ينقص ملف تنفيذي — تثبيت الاعتمادات."
+        prepare_runtime
+    fi
+
+    say "إعادة كتابة الملفات المولَّدة…"
+    write_cfd_config
+    write_xray_config
+    write_init
+    ok "أُعيدت كتابة إعداد xray وcloudflared وملفي الخدمة"
+
+    # ملحقات اختيارية: تُحدَّث فقط إن كانت مفعّلة أصلًا
+    [ -f "$BASE/watchdog.sh" ] && { write_watchdog; ok "حُدِّث ملف المراقبة"; }
+    if uci -q get firewall.xe3000_inc >/dev/null 2>&1; then
+        write_fwinclude
+        sh "$BASE/firewall.sh" 2>/dev/null
+        ok "حُدِّث تجاوز كِل‑سويتش VPN"
+    fi
+
+    enable_services
+    # اللوحة آخر خطوة وأقلها أهمية: شهادة HTTPS مفقودة تُنهي configure_uhttpd
+    # بـ die، ولا يصح أن تُسقط ترقية نجحت. لذا في صدفة فرعية.
+    write_ui_files
+    ( configure_uhttpd ) || warn "تعذر ضبط لوحة $UI_PORT — شغّل: sh $SELF diagnose"
+    install_launchers       # بلا set_password: حماية اللوحة تبقى كما ضبطتها
+
+    if [ "$_keep" = "$(cat "$SETTINGS"; cat "$USERS" 2>/dev/null)" ]; then
+        ok "الإعدادات والمستخدمون لم يتغيّروا بايتًا واحدًا"
+    else
+        warn "تغيّر ملف الإعدادات أو المستخدمين أثناء الترقية — راجع: sh $SELF links"
+    fi
+
+    say ""
+    ok "اكتملت الترقية — الإصدار الآن $VERSION"
+    do_selftest || warn "الترقية تمت لكن فحص السلسلة لم يمرّ — شغّل: sh $SELF doctor"
     return 0
 }
 
@@ -1653,9 +1717,9 @@ do_bootstrap() {
 do_auto_self() {
     need_root
     if installed_complete; then
-        say "بوابة مكتملة — إصلاح لوحة $UI_PORT فقط."
-        FULLTUNNEL_RESTORE_UI=1 do_repair_ui
-        return 0
+        say "بوابة مكتملة — ترقية في المكان بالإعدادات المثبّتة."
+        do_upgrade
+        return $?
     fi
     if installed_partial; then
         say "بقايا تثبيت فاشل — تنظيف تلقائي."
@@ -1738,7 +1802,7 @@ do_menu() {
         say "  3) الروابط             4) تشغيل/إيقاف/إعادة"
         say "  5) فحص السلسلة         6) الصيانة الذاتية"
         say "  7) الإعدادات           8) حماية اللوحة"
-        say "  9) تثبيت/إكمال         0) خروج"
+        say "  9) تثبيت/ترقية         0) خروج"
         read_tty "الاختيار: " _c
         case "$_c" in
             1) act do_status ;;
@@ -2595,6 +2659,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF install          تثبيت يدوي من البداية
   sh $SELF auto [file]      تثبيت بلا أسئلة من ملف إعداد 600
   sh $SELF bootstrap        صفحة الإعداد العربية على LAN:$UI_PORT
+  sh $SELF upgrade          ترقية تثبيت قائم بإعداداته كما هي
   sh $SELF ui-only          إعادة تثبيت لوحة $UI_PORT
   sh $SELF status           حالة البوابة والواجهة
   sh $SELF diagnose         فحص uhttpd والمنفذ $UI_PORT
@@ -2639,6 +2704,7 @@ case "${1:-}" in
     ui-only)            need_root; install_ui ;;
     status)             do_status ;;
     diagnose)           do_diagnose ;;
+    upgrade)            do_upgrade ;;
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     auth)               do_auth "${2:-status}" ;;
