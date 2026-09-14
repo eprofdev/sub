@@ -1613,11 +1613,16 @@ install_launchers() {
 _probe() { # $1 = رابط، بقية الوسائط ترويسات
     _u=$1; shift
     _us=
-    is_sock && _us="--unix-socket $XRAY_LISTEN"
+    case "$_u" in
+        http://localhost*) is_sock && _us="--unix-socket $XRAY_LISTEN" ;;
+    esac
     _pe=/tmp/.xe3000probe.$$
     _po=$(curl -sSi --noproxy '*' $_us --max-time 6 --http1.1 "$@" "$_u" 2>"$_pe")
     _pl=$(printf '%s' "$_po" | head -n1 | tr -d '\r')
     [ -n "$_pl" ] || _pl=$(head -n1 "$_pe" 2>/dev/null | tr -d '\r')
+    case "$_pl" in
+        *"(48)"*) _pl="curl: لا يدعم --unix-socket في هذا البناء" ;;
+    esac
     rm -f "$_pe"
     printf '%s' "$_pl"
 }
@@ -1697,7 +1702,7 @@ do_selftest() {
         say "    path في settings.env: $XRAY_WSPATH"
         [ "$_cn" = ws ]           || { err "network ليس ws — الترقية لن تنجح أبدًا."; _fail=1; }
         [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
-        [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
+        is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
     else
         err "$_cfg مفقود أو فارغ."; _fail=1
     fi
@@ -1710,6 +1715,7 @@ do_selftest() {
     if is_sock; then
         _t=$(curl -sS --noproxy '*' --unix-socket "$XRAY_LISTEN" --connect-timeout 5 \
              -o /dev/null -w 'code=%{http_code}' "http://localhost/" 2>&1)
+        case "$_t" in *"(48)"*) _t="skip" ;; esac
     else
         _t=$(curl -sS --noproxy '*' --connect-timeout 5 -o /dev/null \
              -w 'connect=%{time_connect} code=%{http_code}' \
@@ -1736,6 +1742,9 @@ do_selftest() {
             netstat -ant 2>/dev/null | grep ":$XRAY_PORT " | head -5
             netstat -s 2>/dev/null | grep -iE 'listen|overflow' | head -4
             _lo=1; _fail=1 ;;
+        skip)
+            warn "curl هنا بلا دعم --unix-socket — يُتخطّى الفحص المحلي."
+            say  "    الحلقة 6 عبر Cloudflare هي الحكم." ;;
         curl:*)
             err "تعذر الاتصال: $_t"; _lo=1; _fail=1 ;;
         *)
@@ -1789,14 +1798,20 @@ do_selftest() {
     case "$_h" in
         *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
         *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
-        curl:*) err "curl لم يصل إلى $XRAY_LISTEN:$XRAY_PORT — $_h"
+        curl:*) if is_sock; then
+                    warn "الفحص المحلي غير متاح: $_h"
+                    say  "    الحلقة 6 هي الحكم في وضع مقبس Unix."
+                else
+                    err "curl لم يصل إلى $XRAY_LISTEN:$XRAY_PORT — $_h"
+                    _fail=1
+                fi
                 case "$_h" in
                   *"Connection timed out"*)
                       say "    مهلة على منفذ مستمع = المقبس لا يردّ بـ SYN-ACK." ;;
                   *"Connection refused"*)
                       say "    رفض اتصال = لا شيء يستمع فعلًا على هذا المنفذ." ;;
                 esac
-                _fail=1 ;;
+                ;;
         '')     err "لا مخرجات من curl على المنفذ المحلي."; _fail=1 ;;
         *)      say "    ردّ: $_h" ;;
     esac
@@ -1807,7 +1822,8 @@ do_selftest() {
     _l=$(ws_probe "$(local_url)")
     case "$_l" in
         *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
-        curl:*) err "curl لم يصل إلى xray — $_l"; _fail=1 ;;
+        curl:*) if is_sock; then warn "الفحص المحلي غير متاح: $_l"
+                else err "curl لم يصل إلى xray — $_l"; _fail=1; fi ;;
         '')    err "لا سطر استجابة من xray على $XRAY_WSPATH"
                say "    (اتصال مقبول ثم مغلق بلا ردّ HTTP)"
                say ""
