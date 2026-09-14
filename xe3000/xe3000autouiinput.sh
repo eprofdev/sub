@@ -2252,37 +2252,46 @@ do_doctor() {
 
     # 1) ملف خدمة xray بلا GODEBUG: مستمعو Go يُفتحون بـ MPTCP فلا تكتمل المصافحة
     if ! grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null; then
-        write_init && enable_services >/dev/null 2>&1
-        doctor_fix "ملف الخدمة يضبط GODEBUG=multipathtcp=0"
+        ( write_init >/dev/null 2>&1; enable_services >/dev/null 2>&1 ) || true
+        grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null &&
+            doctor_fix "ملف الخدمة يضبط GODEBUG=multipathtcp=0"
     fi
 
     # 2) TCP Fast Open: يُنتج طلبات اتصال بعناوين مصفّرة على هذه النواة
     _f=/proc/sys/net/ipv4/tcp_fastopen
     if [ -w "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" != 0 ]; then
-        disable_tfo >/dev/null 2>&1; doctor_fix "TCP Fast Open معطّل"
+        ( disable_tfo >/dev/null 2>&1 ) || true
+        [ "$(cat "$_f" 2>/dev/null)" = 0 ] && doctor_fix "TCP Fast Open معطّل"
     fi
 
     # 3) نسخة uhttpd قديمة تحجز منفذ اللوحة
     if uci -q show uhttpd 2>/dev/null | grep -q 'xe3000-fulltunnel-bootstrap'; then
-        drop_legacy_uhttpd; doctor_fix "أُزيلت نسخة uhttpd قديمة"
+        ( drop_legacy_uhttpd >/dev/null 2>&1 ) || true
+        doctor_fix "أُزيلت نسخة uhttpd قديمة"
     fi
 
     # 4) اللوحة مفقودة أو بلا مولّد QR (ترقية لم تُحدّث الصفحات)
+    # كل إصلاح في صدفة فرعية: die داخل دالة مستدعاة لا يُنهي doctor
     if [ ! -f "$UIROOT/cgi-bin/control.cgi" ] ||
        ! grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" 2>/dev/null; then
-        write_ui_files >/dev/null 2>&1
-        FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 || true
-        doctor_fix "أُعيد بناء صفحات اللوحة"
+        ( write_ui_files >/dev/null 2>&1 ) || true
+        ( FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 ) || true
+        grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" 2>/dev/null &&
+            doctor_fix "أُعيد بناء صفحات اللوحة" ||
+            { err "تعذر بناء اللوحة — راجع: sh $SELF ui-only"; _left=$(( _left + 1 )); }
     fi
 
     # 5) قاعدة الجدار الناري للوحة
-    uci -q get firewall.xe3000_panel >/dev/null 2>&1 ||
-        { FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 &&
-          doctor_fix "أُعيدت قاعدة الجدار الناري للوحة"; }
+    if command -v uci >/dev/null 2>&1 && ! uci -q get firewall.xe3000_panel >/dev/null 2>&1; then
+        ( FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 ) || true
+        uci -q get firewall.xe3000_panel >/dev/null 2>&1 &&
+            doctor_fix "أُعيدت قاعدة الجدار الناري للوحة"
+    fi
 
     # 6) كِل‑سويتش VPN موجود بلا تجاوز لمرور cloudflared
     if ip rule show 2>/dev/null | grep -q blackhole && [ ! -f "$BASE/firewall.sh" ]; then
-        do_vpn_bypass on >/dev/null 2>&1 && doctor_fix "فُعّل تجاوز كِل‑سويتش VPN"
+        ( do_vpn_bypass on >/dev/null 2>&1 ) || true
+        [ -f "$BASE/firewall.sh" ] && doctor_fix "فُعّل تجاوز كِل‑سويتش VPN"
     fi
 
     # 7) ناقل ws فوق مقبس Unix: cloudflared لا يمرّر الترقية إلى أصل unix
