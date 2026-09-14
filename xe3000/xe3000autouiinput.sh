@@ -340,7 +340,7 @@ users_init() {
     [ -f "$USERS" ] || { : >"$USERS"; chmod 600 "$USERS"; }
 }
 
-users_count() { users_init; grep -c . "$USERS" 2>/dev/null || echo 0; }
+users_count() { users_init; awk 'NF{n++} END{print n+0}' "$USERS" 2>/dev/null || echo 0; }
 
 users_list() {
     users_init
@@ -1571,8 +1571,10 @@ menu_services() {
 # اختصارات الصدفة: xe3000 و menu
 install_launchers() {
     [ -f "$SELF_ABS" ] || return 0
-    printf '#!/bin/sh\nexec sh %s "$@"\n' "$SELF_ABS" >/usr/bin/xe3000
-    chmod 755 /usr/bin/xe3000
+    if [ ! -e /usr/bin/xe3000 ] || grep -q xe3000autouiinput /usr/bin/xe3000 2>/dev/null; then
+        printf '#!/bin/sh\nexec sh %s "$@"\n' "$SELF_ABS" >/usr/bin/xe3000
+        chmod 755 /usr/bin/xe3000
+    fi
     if [ ! -e /usr/bin/menu ] || grep -q xe3000autouiinput /usr/bin/menu 2>/dev/null; then
         printf '#!/bin/sh\nexec sh %s menu "$@"\n' "$SELF_ABS" >/usr/bin/menu
         chmod 755 /usr/bin/menu
