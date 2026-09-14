@@ -4,7 +4,7 @@
 # ملف واحد، بلا حمولة مضمّنة — يعمل مع wget/curl إلى ملف ثم sh.
 set -u
 
-VERSION="2026-09-14-multi-protocol"
+VERSION="2026-09-14-menu"
 
 BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
@@ -1061,11 +1061,11 @@ if [ -n "$ACT" ]; then
           *) case "$AP" in
                '') MSG="كلمة المرور لا يمكن أن تكون فارغة."; CLS=err ;;
                *[\'\"\\]*) MSG="كلمة المرور بلا علامات اقتباس أو شرطة خلفية."; CLS=err ;;
-               *) MSG=$(FULLTUNNEL_UI_USER="$AU" FULLTUNNEL_UI_PASSWORD="$AP" run auth on); CLS=ok ;;
+               *) MSG=$(FULLTUNNEL_DEFER_RESTART=1 FULLTUNNEL_UI_USER="$AU" FULLTUNNEL_UI_PASSWORD="$AP" run auth on); CLS=ok ;;
              esac ;;
         esac ;;
       authoff)
-        MSG=$(run auth off); CLS=ok ;;
+        MSG=$(FULLTUNNEL_DEFER_RESTART=1 run auth off); CLS=ok ;;
       forget)
         if [ "$(dec "$(arg confirm)")" = FORGET ]; then
           rm -rf "$CREDS"; MSG="حُذفت بيانات Cloudflare المحفوظة."; CLS=ok
@@ -1408,7 +1408,12 @@ configure_uhttpd() {
     uci set uhttpd.xe3000.cgi_prefix=/cgi-bin
     uci set uhttpd.xe3000.rfc1918_filter=1
     uci add_list uhttpd.xe3000.index_page=index.html
-    [ -f "$UIROOT/httpd.conf" ] && uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
+    # بلا ملف حماية: احذف الخيار كي لا يشير إلى ملف محذوف بعد تعطيل الحماية
+    if [ -s "$UIROOT/httpd.conf" ]; then
+        uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
+    else
+        uci -q delete uhttpd.xe3000.config
+    fi
     uci commit uhttpd
 
     # فتح المنفذ على شبكة LAN فقط — بعض صور GL.iNet ترفض المدخلات غير المصرّح بها
@@ -1430,8 +1435,12 @@ configure_uhttpd() {
     /etc/init.d/uhttpd restart >/dev/null 2>&1 || die "تعذر إعادة تشغيل uhttpd"
     sleep 1
     if netstat -ltn 2>/dev/null | grep -q "$_ip:$UI_PORT_S "; then
-        ok "اللوحة على https://$_ip:$UI_PORT_S/cgi-bin/control.cgi"
-        ok "و http://$_ip:$UI_PORT/ يحوّل إليها تلقائيًا"
+        ok "اللوحة على http://$_ip:$UI_PORT/  و  https://$_ip:$UI_PORT_S/"
+        if [ -s "$UIROOT/httpd.conf" ]; then
+            say "الحماية مفعّلة — ستُطلب بيانات الدخول."
+        else
+            say "بلا اسم مستخدم أو كلمة مرور — فعّلها من زر «حماية اللوحة» في الصفحة."
+        fi
     else
         warn "uhttpd أُعيد تشغيله لكن المنفذ $UI_PORT لا يستمع — شغّل: sh $SELF diagnose"
     fi
@@ -1691,34 +1700,55 @@ do_set_token() {
 # ----------------------------------------------------------------- قائمة SSH
 menu_pause() { read_tty "اضغط Enter للمتابعة… " _x; }
 
+# كل إجراء في صدفة فرعية: أي die داخله لا يُنهي القائمة.
+act() { ( "$@" ) || true; }
+
+svc_state() {
+    [ -x "/etc/init.d/$1" ] || { printf 'غير مثبت'; return 0; }
+    /etc/init.d/"$1" running >/dev/null 2>&1 && printf 'يعمل' || printf 'متوقف'
+}
+
+watchdog_state() {
+    if grep -q 'xe3000-cf-fulltunnel/watchdog.sh' /etc/crontabs/root 2>/dev/null; then
+        _wm=$(sed -n 's#^\*/\([0-9]*\) .*watchdog.sh#\1#p' /etc/crontabs/root 2>/dev/null | head -1)
+        printf 'مفعّلة (كل %s د)' "${_wm:-?}"
+    else
+        printf 'معطّلة'
+    fi
+}
+
+auth_state() { [ -s "$UIROOT/httpd.conf" ] && printf 'مفعّلة' || printf 'معطّلة'; }
+
 do_menu() {
     has_tty || die "الأمر menu تفاعلي — شغّله من جلسة SSH."
     while : ; do
         printf '\n'
-        say "══════ XE3000 Full-Tunnel ══════"
+        say "══════════ XE3000 Full-Tunnel ══════════"
         if load_settings 2>/dev/null; then
             say "  المضيف: $(mask "$CF_HOSTNAME")    المستخدمون: $(users_count)"
-            say "  xray: $(/etc/init.d/xe3000-cf-xray running >/dev/null 2>&1 && echo يعمل || echo متوقف)   cloudflared: $(/etc/init.d/xe3000-cf-tunnel running >/dev/null 2>&1 && echo يعمل || echo متوقف)"
+            say "  الناقل: ${XRAY_NET:-ws}/${XRAY_PROTO:-vless}   الاستماع: $(mask "$XRAY_LISTEN")"
+            say "  xray: $(svc_state xe3000-cf-xray)   cloudflared: $(svc_state xe3000-cf-tunnel)"
+            say "  المراقبة: $(watchdog_state)   الحماية: $(auth_state)"
         else
             say "  غير مثبت"
         fi
-        say "────────────────────────────────"
-        say "  1) الحالة            2) المستخدمون"
-        say "  3) الروابط           4) تشغيل/إيقاف/إعادة"
-        say "  5) تشخيص             6) تبديل التوكن"
-        say "  7) كلمة مرور اللوحة  8) لوحة 9000"
-        say "  9) تثبيت/إكمال       0) خروج"
+        say "────────────────────────────────────────"
+        say "  1) الحالة              2) المستخدمون"
+        say "  3) الروابط             4) تشغيل/إيقاف/إعادة"
+        say "  5) فحص السلسلة         6) الصيانة الذاتية"
+        say "  7) الإعدادات           8) حماية اللوحة"
+        say "  9) تثبيت/إكمال         0) خروج"
         read_tty "الاختيار: " _c
         case "$_c" in
-            1) do_status ;;
+            1) act do_status ;;
             2) menu_users ;;
-            3) users_links ;;
+            3) act users_links ;;
             4) menu_services ;;
-            5) do_diagnose; say ""; do_selftest || true ;;
-            6) do_set_token || true ;;
-            7) need_root; set_password 1 && configure_uhttpd ;;
-            8) say "https://$(lan_ip):$UI_PORT_S/cgi-bin/control.cgi  (أو http://$(lan_ip):$UI_PORT/)" ;;
-            9) do_auto_self || true ;;
+            5) act do_selftest ;;
+            6) menu_maint ;;
+            7) menu_settings ;;
+            8) menu_auth ;;
+            9) act do_auto_self ;;
             0|q|Q) return 0 ;;
             *) warn "اختيار غير معروف." ;;
         esac
@@ -1726,6 +1756,7 @@ do_menu() {
     done
 }
 
+# ── المستخدمون ──
 menu_users() {
     while : ; do
         printf '\n'
@@ -1735,15 +1766,102 @@ menu_users() {
         read_tty "الاختيار: " _c
         case "$_c" in
             a|A) read_tty "الاسم (فارغ = تلقائي): " _n
-                 user_add "$_n" >/dev/null && users_apply ;;
+                 ( user_add "$_n" >/dev/null && users_apply ) || true ;;
             d|D) read_tty "الاسم أو المعرّف للحذف: " _k
                  [ "$(users_count)" -gt 1 ] || { warn "لا يمكن حذف آخر مستخدم."; continue; }
-                 user_del "$_k" && users_apply ;;
-            r|R) users_apply ;;
+                 ( user_del "$_k" && users_apply ) || true ;;
+            r|R) act users_apply ;;
             b|B|'') return 0 ;;
             *) warn "اختيار غير معروف." ;;
         esac
     done
+}
+
+# ── الصيانة الذاتية ──
+menu_maint() {
+    while : ; do
+        printf '\n'
+        say "── الصيانة الذاتية ──"
+        say "  المراقبة الآن: $(watchdog_state)"
+        say "  1) إصلاح ذاتي الآن (doctor)"
+        say "  2) ابحث عن إعداد يعمل (autotune)"
+        say "  3) تحديث السكربت (selfupdate)"
+        say "  4) المراقبة الدورية: تفعيل"
+        say "  5) المراقبة الدورية: تعطيل"
+        say "  6) تجربة المراقبة مرة واحدة"
+        say "  b) رجوع"
+        read_tty "الاختيار: " _c
+        case "$_c" in
+            1) act do_doctor ;;
+            2) act do_autotune ;;
+            3) act do_selfupdate; return 0 ;;
+            4) read_tty "كل كم دقيقة؟ [5]: " _m; [ -n "$_m" ] || _m=5
+               act do_watchdog on "$_m" ;;
+            5) act do_watchdog off ;;
+            6) act do_watchdog test ;;
+            b|B|'') return 0 ;;
+            *) warn "اختيار غير معروف." ;;
+        esac
+        menu_pause
+    done
+}
+
+# ── الإعدادات ──
+menu_settings() {
+    while : ; do
+        load_settings 2>/dev/null
+        printf '\n'
+        say "── الإعدادات ──"
+        say "  الناقل: ${XRAY_NET:-ws}   البروتوكول: ${XRAY_PROTO:-vless}"
+        say "  الاستماع: $(mask "$XRAY_LISTEN")   المنفذ: ${XRAY_PORT:-?}"
+        say "  جسر SSH: $([ "${SSHWS:-0}" = 1 ] && echo مفعّل || echo معطّل)"
+        say "   1) الناقل ws            2) الناقل xhttp"
+        say "   3) البروتوكول vless     4) البروتوكول trojan"
+        say "   5) الاستماع 127.0.0.1   6) الاستماع على LAN"
+        say "   7) الاستماع مقبس Unix   8) تبديل المنفذ"
+        say "   9) جسر SSH تفعيل       10) جسر SSH تعطيل"
+        say "  11) تجاوز كِل-سويتش VPN  12) إلغاء التجاوز"
+        say "  13) تبديل توكن Cloudflare"
+        say "   b) رجوع"
+        read_tty "الاختيار: " _c
+        case "$_c" in
+            1)  act do_set_transport ws ;;
+            2)  act do_set_transport xhttp ;;
+            3)  act do_set_protocol vless ;;
+            4)  act do_set_protocol trojan ;;
+            5)  act do_set_listen 127.0.0.1 ;;
+            6)  act do_set_listen "$(lan_ip)" ;;
+            7)  act do_set_listen unix ;;
+            8)  read_tty "المنفذ الجديد: " _p; act do_set_port "$_p" ;;
+            9)  act do_sshws on ;;
+            10) act do_sshws off ;;
+            11) act do_vpn_bypass on ;;
+            12) act do_vpn_bypass off ;;
+            13) act do_set_token ;;
+            b|B|'') return 0 ;;
+            *) warn "اختيار غير معروف." ;;
+        esac
+        menu_pause
+    done
+}
+
+# ── حماية اللوحة ──
+menu_auth() {
+    printf '\n'
+    say "── حماية اللوحة ──  الحالة: $(auth_state)"
+    say "  1) تفعيل باسم وكلمة مرور"
+    say "  2) تعطيل"
+    say "  3) العنوان"
+    say "  b) رجوع"
+    read_tty "الاختيار: " _c
+    case "$_c" in
+        1) read_tty "اسم المستخدم [admin]: " _u; [ -n "$_u" ] || _u=admin
+           read_tty "كلمة المرور: " _p 1
+           ( FULLTUNNEL_UI_USER="$_u" FULLTUNNEL_UI_PASSWORD="$_p" do_auth on ) || true ;;
+        2) act do_auth off ;;
+        3) say "http://$(lan_ip):$UI_PORT/   و   https://$(lan_ip):$UI_PORT_S/" ;;
+        *) : ;;
+    esac
 }
 
 menu_services() {
@@ -2423,6 +2541,15 @@ do_selfupdate() {
     sh "$SELF_ABS" doctor
 }
 
+# اللوحة نفسها تعمل تحت uhttpd: إعادة التشغيل الفورية تقطع ردّ CGI قبل وصوله.
+uhttpd_reload() {
+    if [ "${FULLTUNNEL_DEFER_RESTART:-0}" = 1 ]; then
+        ( sleep 2; /etc/init.d/uhttpd restart ) </dev/null >/dev/null 2>&1 &
+        return 0
+    fi
+    /etc/init.d/uhttpd restart >/dev/null 2>&1
+}
+
 do_auth() {
     need_root
     case "${1:-status}" in
@@ -2441,13 +2568,13 @@ do_auth() {
             chmod 600 "$UIROOT/httpd.conf"
             uci set uhttpd.xe3000.config="$UIROOT/httpd.conf" 2>/dev/null
             uci commit uhttpd 2>/dev/null
-            /etc/init.d/uhttpd restart >/dev/null 2>&1
-            ok "الحماية مفعّلة للمستخدم $_u" ;;
+            uhttpd_reload
+            ok "الحماية مفعّلة للمستخدم $_u — سيطلب المتصفح الاسم وكلمة المرور بعد لحظات." ;;
         off|0)
             rm -f "$UIROOT/httpd.conf"
             uci -q delete uhttpd.xe3000.config 2>/dev/null
             uci commit uhttpd 2>/dev/null
-            /etc/init.d/uhttpd restart >/dev/null 2>&1
+            uhttpd_reload
             ok "الحماية معطّلة — اللوحة مفتوحة لشبكة LAN" ;;
         status)
             if [ -s "$UIROOT/httpd.conf" ]; then

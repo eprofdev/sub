@@ -76,7 +76,8 @@ jobs:
               -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
               xe3000autouiinput.sh > "$T/x.sh"
           mkdir -p "$T/base/state"
-          printf 'FULLTUNNEL_HOSTNAME=h.example.com\nFULLTUNNEL_TUNNEL_ID=t\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/p\n' \
+          # UUID نائب: يشغّل ترحيل المستخدم الوحيد القديم إلى قائمة المستخدمين
+          printf 'FULLTUNNEL_HOSTNAME=h.example.com\nFULLTUNNEL_TUNNEL_ID=t\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/p\nFULLTUNNEL_XRAY_UUID=11111111-1111-1111-1111-111111111111\n' \
             > "$T/base/state/settings.env"
           : > "$T/base/state/users.tsv"
           sudo sh "$T/x.sh" user-add ahmed
