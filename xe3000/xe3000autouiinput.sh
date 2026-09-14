@@ -440,6 +440,14 @@ cfd_service() {
 
 write_cfd_config() {
     mkdir -p "$CFD_DIR"
+    # أصل unix: بلا اسم مضيف يجعل cloudflared يفشل بـ "no Host in request URL"
+    if is_sock; then
+        _oreq='
+    originRequest:
+      httpHostHeader: localhost'
+    else
+        _oreq=
+    fi
     cat >"$CFD_DIR/config.yml" <<CFDCFG
 tunnel: $TUNNEL_ID
 credentials-file: $BASE/tunnel/$TUNNEL_ID.json
@@ -448,7 +456,7 @@ no-autoupdate: true
 loglevel: info
 ingress:
   - hostname: $CF_HOSTNAME
-    service: $(cfd_service)
+    service: $(cfd_service)$_oreq
   - service: http_status:404
 CFDCFG
     chmod 600 "$CFD_DIR/config.yml"
