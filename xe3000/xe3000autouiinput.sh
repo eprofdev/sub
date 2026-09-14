@@ -1669,18 +1669,24 @@ do_selftest() {
     say ""
     say "── 2ج) وصول TCP إلى المنفذ المحلي ──"
     # فشل بمهلة على منفذ مستمع = إسقاط حزم، لا رفض اتصال
-    if command -v nc >/dev/null 2>&1; then
-        if nc -w 3 -z "$XRAY_LISTEN" "$XRAY_PORT" >/dev/null 2>&1; then
-            ok "nc وصل إلى $XRAY_LISTEN:$XRAY_PORT — الطبقة الرابعة سليمة"
-        else
-            err "nc لم يصل إلى $XRAY_LISTEN:$XRAY_PORT"
-            say "    إن كانت الحلقة 2 أظهرت المنفذ مستمعًا فهذا إسقاط حزم على"
-            say "    loopback — جدار ناري أو اعتراض TPROXY/REDIRECT، لا عطل في xray."
-            _lo=1; _fail=1
-        fi
-    else
-        say "    nc غير مثبت — تُخطّى."
-    fi
+    # nc في BusyBox لا يدعم -z ولا -w، فاستعماله هنا يعطي فشلًا كاذبًا.
+    # مرحلة الاتصال في curl هي القياس الصحيح: أي ردّ HTTP أو رفض = وصلنا.
+    _t=$(curl -sS --noproxy '*' --connect-timeout 5 -o /dev/null \
+         -w 'connect=%{time_connect} code=%{http_code}' \
+         "http://$XRAY_LISTEN:$XRAY_PORT/" 2>&1)
+    case "$_t" in
+        *"Connection refused"*)
+            err "الاتصال مرفوض على $XRAY_LISTEN:$XRAY_PORT — لا شيء يستمع فعلًا."
+            _lo=1; _fail=1 ;;
+        *"timed out"*|*"Timeout"*)
+            err "انتهت مهلة الاتصال بـ $XRAY_LISTEN:$XRAY_PORT رغم أن المنفذ مستمع."
+            say "    مصافحة TCP لا تكتمل — حزم لا تصل أو لا تعود."
+            _lo=1; _fail=1 ;;
+        curl:*)
+            err "تعذر الاتصال: $_t"; _lo=1; _fail=1 ;;
+        *)
+            ok "مصافحة TCP اكتملت ($_t)" ;;
+    esac
     if [ "${_lo:-0}" = 1 ] || [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
         # EPERM على حزمة محلية = إسقاط في LOCAL_OUT، فالدليل في سلسلة OUTPUT
         say "    ── conntrack ──"
@@ -1696,7 +1702,8 @@ do_selftest() {
         say "    ── INPUT/OUTPUT (filter) مع العدّادات بعد محاولة اتصال ──"
         iptables -Z OUTPUT >/dev/null 2>&1
         iptables -Z INPUT  >/dev/null 2>&1
-        ( nc -w 2 -z "$XRAY_LISTEN" "$XRAY_PORT" >/dev/null 2>&1 || true )
+        curl -sS --noproxy '*' --connect-timeout 5 -o /dev/null \
+             "http://$XRAY_LISTEN:$XRAY_PORT/" >/dev/null 2>&1 || true
         iptables -L INPUT  -n -v --line-numbers 2>/dev/null | head -18 || say "    (iptables غير متاح)"
         iptables -L OUTPUT -n -v --line-numbers 2>/dev/null | head -18
         say "    ── OUTPUT (mangle) ──"
