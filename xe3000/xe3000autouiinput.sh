@@ -4,7 +4,7 @@
 # ملف واحد، بلا حمولة مضمّنة — يعمل مع wget/curl إلى ملف ثم sh.
 set -u
 
-VERSION="2026-09-12-single-file"
+VERSION="2026-09-14-multi-protocol"
 
 BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
@@ -2307,7 +2307,17 @@ case "${1:-}" in
     prepare-runtime)    need_root; prepare_runtime ;;
     reinstall-services) need_root; load_settings || die "لا يوجد تثبيت محلي."
                         write_init; enable_services ;;
-    version)            say "$VERSION" ;;
+    version)            say "السكربت : $VERSION"
+                        if [ -f "$SETTINGS" ]; then
+                            say "المثبَّت : $(sed -n 's/^FULLTUNNEL_VERSION=//p' "$SETTINGS")"
+                        fi
+                        if [ -f "$UIROOT/cgi-bin/control.cgi" ]; then
+                            say "اللوحة  : $(grep -o 'اللوحة: [^<]*' "$UIROOT/cgi-bin/control.cgi" | head -1 | sed 's/^اللوحة: //')"
+                            grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" &&
+                                say "          فيها مولّد QR ✓" || say "          بلا مولّد QR ✗"
+                        else
+                            say "اللوحة  : غير مثبتة"
+                        fi ;;
     help|-h|--help)     usage ;;
     *)                  err "أمر غير معروف: $1"; usage; exit 1 ;;
 esac
