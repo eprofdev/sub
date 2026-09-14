@@ -1511,7 +1511,7 @@ show_client() {
     done <"$USERS"
     say ""
     show_ssh
-    say "لرمز QR ونسخ الروابط بضغطة: https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi"
+    say "لرمز QR ونسخ الروابط بضغطة: http://$(lan_ip):$UI_PORT/  أو  https://$(lan_ip):$UI_PORT_S/"
 }
 
 do_status() {
@@ -1645,7 +1645,8 @@ do_bootstrap() {
     write_ui_files
     set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
     configure_uhttpd
-    ok "افتح https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
+    ok "افتح http://$(lan_ip):$UI_PORT/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
+    say "أو عبر HTTPS: https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi"
 }
 
 # لا وسائط: يقرر وحده
