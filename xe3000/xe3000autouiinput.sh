@@ -24,7 +24,7 @@ esac
 
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
-XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=
+XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -414,7 +414,7 @@ users_apply() {
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "listen": "127.0.0.1",
+      "listen": "$XRAY_LISTEN",
       "port": $XRAY_PORT,
       "protocol": "vless",
       "settings": { "clients": [ $_clients ], "decryption": "none" },
@@ -487,6 +487,7 @@ write_configs() {
     chmod 600 "$BASE/tunnel/$TUNNEL_ID.json"
 
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
+    XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
     users_init
     if [ ! -s "$USERS" ]; then
@@ -506,7 +507,7 @@ no-autoupdate: true
 loglevel: info
 ingress:
   - hostname: $CF_HOSTNAME
-    service: http://127.0.0.1:$XRAY_PORT
+    service: http://$XRAY_LISTEN:$XRAY_PORT
   - service: http_status:404
 CFDCFG
     chmod 600 "$CFD_DIR/config.yml"
@@ -584,6 +585,7 @@ FULLTUNNEL_HOSTNAME=$CF_HOSTNAME
 FULLTUNNEL_TUNNEL_ID=$TUNNEL_ID
 FULLTUNNEL_TUNNEL_NAME=$TUNNEL_NAME
 FULLTUNNEL_XRAY_PORT=$XRAY_PORT
+FULLTUNNEL_XRAY_LISTEN=$XRAY_LISTEN
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -599,6 +601,7 @@ load_settings() {
     TUNNEL_ID=${FULLTUNNEL_TUNNEL_ID:-}
     TUNNEL_NAME=${FULLTUNNEL_TUNNEL_NAME:-}
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-}
+    XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
@@ -1635,8 +1638,8 @@ do_selftest() {
 
     say ""
     say "── 2) xray يستمع محليًا ──"
-    if netstat -ltn 2>/dev/null | grep -q "127.0.0.1:$XRAY_PORT "; then
-        ok "المنفذ $XRAY_PORT مفتوح على 127.0.0.1"
+    if netstat -ltn 2>/dev/null | grep -q "$XRAY_LISTEN:$XRAY_PORT "; then
+        ok "المنفذ $XRAY_PORT مفتوح على $XRAY_LISTEN"
     else
         err "المنفذ $XRAY_PORT غير مفتوح — xray لم يبدأ أو الإعداد خاطئ."
         say "    logread | grep xray | tail -20"
@@ -1667,10 +1670,10 @@ do_selftest() {
     say "── 2ج) وصول TCP إلى المنفذ المحلي ──"
     # فشل بمهلة على منفذ مستمع = إسقاط حزم، لا رفض اتصال
     if command -v nc >/dev/null 2>&1; then
-        if nc -w 3 -z 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
-            ok "nc وصل إلى 127.0.0.1:$XRAY_PORT — الطبقة الرابعة سليمة"
+        if nc -w 3 -z "$XRAY_LISTEN" "$XRAY_PORT" >/dev/null 2>&1; then
+            ok "nc وصل إلى $XRAY_LISTEN:$XRAY_PORT — الطبقة الرابعة سليمة"
         else
-            err "nc لم يصل إلى 127.0.0.1:$XRAY_PORT"
+            err "nc لم يصل إلى $XRAY_LISTEN:$XRAY_PORT"
             say "    إن كانت الحلقة 2 أظهرت المنفذ مستمعًا فهذا إسقاط حزم على"
             say "    loopback — جدار ناري أو اعتراض TPROXY/REDIRECT، لا عطل في xray."
             _lo=1; _fail=1
@@ -1693,11 +1696,11 @@ do_selftest() {
 
     say ""
     say "── 3أ) هل يتكلم xray بروتوكول HTTP على المنفذ؟ ──"
-    _h=$(http_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
+    _h=$(http_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
     case "$_h" in
         *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
         *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
-        curl:*) err "curl لم يصل إلى 127.0.0.1:$XRAY_PORT — $_h"
+        curl:*) err "curl لم يصل إلى $XRAY_LISTEN:$XRAY_PORT — $_h"
                 case "$_h" in
                   *"Connection timed out"*)
                       say "    مهلة في مصافحة TCP على منفذ مستمع = حزم تُسقَط." ;;
@@ -1712,7 +1715,7 @@ do_selftest() {
     say ""
     say "── 3ب) مصافحة WebSocket محليًا ──"
     # ترقية ناجحة تُبقي الاتصال مفتوحًا، فلا يصلح %{http_code}: نقرأ سطر الحالة نفسه.
-    _l=$(ws_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
+    _l=$(ws_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
     case "$_l" in
         *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
         curl:*) err "curl لم يصل إلى xray — $_l"; _fail=1 ;;
@@ -1791,6 +1794,26 @@ do_selftest() {
     return $_fail
 }
 
+# مخرج حين يكون loopback معطوبًا على الراوتر: اربط xray على عنوان آخر
+do_set_listen() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    _a=${1:-}
+    [ -n "$_a" ] || _a=$(lan_ip)
+    case "$_a" in
+        0.0.0.0|::) die "رفض الربط على $_a — سيعرّض xray للإنترنت." ;;
+        *[!0-9.]*)  die "عنوان غير صالح: $_a" ;;
+    esac
+    XRAY_LISTEN=$_a
+    save_settings
+    users_apply
+    sed -i "s#service: http://[^:]*:$XRAY_PORT#service: http://$XRAY_LISTEN:$XRAY_PORT#" \
+        "$CFD_DIR/config.yml" || die "تعذر تحديث إعداد cloudflared"
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "xray يستمع الآن على $XRAY_LISTEN:$XRAY_PORT وcloudflared يقصده."
+    say "تحقق: sh $SELF selftest"
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -1805,6 +1828,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
+  sh $SELF set-listen [عنوان] ربط xray على عنوان آخر (مخرج عطل loopback)
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -1835,6 +1859,7 @@ case "${1:-}" in
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     set-token)          do_set_token ;;
     selftest)           do_selftest ;;
+    set-listen)         do_set_listen "${2:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
