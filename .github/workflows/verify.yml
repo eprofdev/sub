@@ -68,6 +68,33 @@ jobs:
           ! grep -q '@SELF@' "$T/base/ui/cgi-bin/setup.cgi"
           echo "qr library injected, placeholders resolved"
 
+      - name: User add/delete rewrites the xray client list
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          mkdir -p "$T/base/state"
+          printf 'FULLTUNNEL_HOSTNAME=h.example.com\nFULLTUNNEL_TUNNEL_ID=t\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/p\n' \
+            > "$T/base/state/settings.env"
+          : > "$T/base/state/users.tsv"
+          sudo sh "$T/x.sh" user-add ahmed
+          sudo sh "$T/x.sh" user-add sara
+          sudo chmod -R a+rX "$T"
+          python3 - "$T/base/xray/config.json" <<'PY'
+          import json,sys
+          c=json.load(open(sys.argv[1]))["inbounds"][0]["settings"]["clients"]
+          names=[x["email"] for x in c]
+          assert names==["user1","ahmed","sara"], names
+          assert len({x["id"] for x in c})==3
+          print("clients:", names)
+          PY
+          sudo sh "$T/x.sh" user-del ahmed
+          sudo chmod -R a+rX "$T"
+          grep -q '"email": "ahmed"' "$T/base/xray/config.json" && exit 1
+          echo "user list drives the xray config"
+
       - name: SHA256SUMS matches tracked files
         run: sha256sum -c SHA256SUMS
 

@@ -406,8 +406,10 @@ users_apply() {
     load_settings || die "لا يوجد تثبيت محلي."
     users_init
     [ -s "$USERS" ] || die "لا يمكن ترك القائمة فارغة — أضف مستخدمًا أولًا."
+    [ -n "$XRAY_PORT" ] && [ -n "$XRAY_WSPATH" ] || die "إعداد ناقص في $SETTINGS — أعد التثبيت."
+    mkdir -p "$XRAY_DIR" || die "تعذر إنشاء $XRAY_DIR"
     _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
-    cat >"$XRAY_DIR/config.json" <<XRAYCFG
+    cat >"$XRAY_DIR/config.json.new" <<XRAYCFG
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -422,8 +424,16 @@ users_apply() {
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
 XRAYCFG
+    # لا تستبدل الإعداد العامل إلا بعد التأكد من اكتمال الكتابة
+    [ -s "$XRAY_DIR/config.json.new" ] || { rm -f "$XRAY_DIR/config.json.new"; die "فشلت كتابة إعداد xray."; }
+    grep -q '"clients"' "$XRAY_DIR/config.json.new" || { rm -f "$XRAY_DIR/config.json.new"; die "إعداد xray المولَّد غير مكتمل."; }
+    mv "$XRAY_DIR/config.json.new" "$XRAY_DIR/config.json" || die "تعذر تثبيت إعداد xray."
     chmod 600 "$XRAY_DIR/config.json"
-    /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل xray"
+    if [ -x /etc/init.d/xe3000-cf-xray ]; then
+        /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل xray — شغّل: /etc/init.d/xe3000-cf-xray restart"
+    else
+        warn "خدمة xray غير مثبتة بعد — سيُستخدم الإعداد عند اكتمال التثبيت."
+    fi
     ok "طُبّقت القائمة ($(users_count) مستخدم)"
 }
 
