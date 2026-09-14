@@ -1024,13 +1024,15 @@ if [ "${REQUEST_METHOD:-GET}" = POST ] && [ -n "${CONTENT_LENGTH:-}" ]; then
   BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
 fi
 ACT=$(arg action)
-case "$ACT" in ''|start|stop|restart|useradd|userdel|forget) : ;; *) ACT=invalid ;; esac
+case "$ACT" in ''|start|stop|restart|useradd|userdel|forget|authon|authoff) : ;; *) ACT=invalid ;; esac
 
 installed() { [ -f "$SETTINGS" ] && [ -x /etc/init.d/xe3000-cf-tunnel ]; }
 run() { [ -f "$INSTALLER" ] && sh "$INSTALLER" "$@" 2>&1; }
 
 if [ -n "$ACT" ]; then
-  if ! installed && [ "$ACT" != forget ]; then
+  # حماية اللوحة وحذف البيانات لا يتوقفان على اكتمال تثبيت البوابة
+  case "$ACT" in forget|authon|authoff) _needinst=0 ;; *) _needinst=1 ;; esac
+  if [ "$_needinst" = 1 ] && ! installed; then
     MSG="البوابة غير مثبتة — لا يمكن تنفيذ الأمر."; CLS=err
   else
     case "$ACT" in
@@ -1051,6 +1053,19 @@ if [ -n "$ACT" ]; then
           ''|*[!A-Za-z0-9_.-]* ) MSG="معرّف غير صالح."; CLS=err ;;
           * ) MSG=$(run user-del "$U"); CLS=ok ;;
         esac ;;
+      authon)
+        AU=$(dec "$(arg auser)"); AP=$(dec "$(arg apass)")
+        [ -n "$AU" ] || AU=admin
+        case "$AU" in
+          *[!A-Za-z0-9_.-]*) MSG="اسم المستخدم: حروف وأرقام و . _ - فقط."; CLS=err ;;
+          *) case "$AP" in
+               '') MSG="كلمة المرور لا يمكن أن تكون فارغة."; CLS=err ;;
+               *[\'\"\\]*) MSG="كلمة المرور بلا علامات اقتباس أو شرطة خلفية."; CLS=err ;;
+               *) MSG=$(FULLTUNNEL_UI_USER="$AU" FULLTUNNEL_UI_PASSWORD="$AP" run auth on); CLS=ok ;;
+             esac ;;
+        esac ;;
+      authoff)
+        MSG=$(run auth off); CLS=ok ;;
       forget)
         if [ "$(dec "$(arg confirm)")" = FORGET ]; then
           rm -rf "$CREDS"; MSG="حُذفت بيانات Cloudflare المحفوظة."; CLS=ok
@@ -1165,6 +1180,27 @@ cat <<'HTML'
 <p>ملفا الخدمة يُنشآن في الخطوة [4/6]. غيابهما يعني أن التثبيت توقف قبلها.</p>
 <p><a class="btn" href="setup.cgi">افتح صفحة الإعداد</a></p>
 <p>أو على الراوتر: <code>sh /root/xe3000autouiinput.sh install</code></p></div>
+HTML
+fi
+
+if [ -s "$BASE/ui/httpd.conf" ]; then
+  AUTHU=$(cut -d: -f2 "$BASE/ui/httpd.conf" 2>/dev/null)
+  cat <<HTML
+<div class="card"><h2>حماية اللوحة</h2>
+<p>مفعّلة — المستخدم <b>$AUTHU</b></p>
+<form method="post"><input type="hidden" name="action" value="authoff">
+<button class="del">تعطيل الحماية</button></form></div>
+HTML
+else
+  cat <<'HTML'
+<div class="card"><h2>حماية اللوحة</h2>
+<p class="warn">معطّلة — أي جهاز على شبكتك المحلية يفتح هذه اللوحة ويرى الروابط.</p>
+<form method="post">
+  <input type="hidden" name="action" value="authon">
+  <p><input name="auser" placeholder="اسم المستخدم" value="admin" size="16"></p>
+  <p><input name="apass" type="password" placeholder="كلمة المرور" size="16"></p>
+  <button>تفعيل الحماية</button>
+</form></div>
 HTML
 fi
 
@@ -1288,10 +1324,11 @@ UISETUP
 }
 
 set_password() { # $1 = enabled flag
-    _enabled=${1:-1}
+    _enabled=${1:-0}
     if [ "$_enabled" = 0 ]; then
         rm -f "$UIROOT/httpd.conf"
-        warn "المصادقة معطّلة بطلبك (auth.enabled=0) — اللوحة بلا كلمة مرور."
+        say "اللوحة بلا كلمة مرور (محلية فقط). لتفعيلها: زر الحماية في الصفحة"
+        say "أو: sh $SELF auth on"
         return 0
     fi
     _user=${FULLTUNNEL_UI_USER:-admin}
@@ -1362,10 +1399,10 @@ configure_uhttpd() {
     uci -q delete uhttpd.xe3000
     uci set uhttpd.xe3000=uhttpd
     uci set uhttpd.xe3000.home="$UIROOT"
-    # uhttpd لا يجمع HTTP وHTTPS على منفذ واحد: 9000 مدخل HTTP يحوّل إلى HTTPS
+    # المخططان يعملان معًا: 9000 عبر HTTP و9443 عبر HTTPS، بلا تحويل قسري
     uci add_list uhttpd.xe3000.listen_http="$_ip:$UI_PORT"
     uci add_list uhttpd.xe3000.listen_https="$_ip:$UI_PORT_S"
-    uci set uhttpd.xe3000.redirect_https=1
+    uci set uhttpd.xe3000.redirect_https=0
     uci set uhttpd.xe3000.cert=/etc/uhttpd.crt
     uci set uhttpd.xe3000.key=/etc/uhttpd.key
     uci set uhttpd.xe3000.cgi_prefix=/cgi-bin
@@ -1402,7 +1439,7 @@ configure_uhttpd() {
 
 install_ui() {
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
     configure_uhttpd
 }
 
@@ -1597,7 +1634,7 @@ do_repair_ui() {
 do_bootstrap() {
     need_root
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
     configure_uhttpd
     ok "افتح https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
 }
@@ -2386,6 +2423,42 @@ do_selfupdate() {
     sh "$SELF_ABS" doctor
 }
 
+do_auth() {
+    need_root
+    case "${1:-status}" in
+        on|1)
+            _u=${FULLTUNNEL_UI_USER:-admin}
+            _p=${FULLTUNNEL_UI_PASSWORD:-}
+            case "$_u" in *[!A-Za-z0-9_.-]*) die "اسم المستخدم: حروف وأرقام و . _ - فقط." ;; esac
+            if [ -z "$_p" ]; then
+                has_tty || die "مرّر FULLTUNNEL_UI_PASSWORD أو شغّله من طرفية."
+                read_tty "كلمة المرور: " _p 1
+            fi
+            [ -n "$_p" ] || die "كلمة المرور لا يمكن أن تكون فارغة."
+            case "$_p" in *[\'\"\\\\]*) die "كلمة المرور بلا علامات اقتباس أو شرطة خلفية." ;; esac
+            mkdir -p "$UIROOT"
+            printf '/:%s:%s\n' "$_u" "$(openssl passwd -1 "$_p")" >"$UIROOT/httpd.conf"
+            chmod 600 "$UIROOT/httpd.conf"
+            uci set uhttpd.xe3000.config="$UIROOT/httpd.conf" 2>/dev/null
+            uci commit uhttpd 2>/dev/null
+            /etc/init.d/uhttpd restart >/dev/null 2>&1
+            ok "الحماية مفعّلة للمستخدم $_u" ;;
+        off|0)
+            rm -f "$UIROOT/httpd.conf"
+            uci -q delete uhttpd.xe3000.config 2>/dev/null
+            uci commit uhttpd 2>/dev/null
+            /etc/init.d/uhttpd restart >/dev/null 2>&1
+            ok "الحماية معطّلة — اللوحة مفتوحة لشبكة LAN" ;;
+        status)
+            if [ -s "$UIROOT/httpd.conf" ]; then
+                say "الحماية: مفعّلة (المستخدم: $(cut -d: -f2 "$UIROOT/httpd.conf"))"
+            else
+                say "الحماية: معطّلة"
+            fi ;;
+        *) die "الاستعمال: auth on|off|status" ;;
+    esac
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -2398,6 +2471,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF status           حالة البوابة والواجهة
   sh $SELF diagnose         فحص uhttpd والمنفذ $UI_PORT
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
+  sh $SELF auth on|off|status  حماية اللوحة باسم وكلمة مرور
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
@@ -2439,6 +2513,7 @@ case "${1:-}" in
     diagnose)           do_diagnose ;;
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
+    auth)               do_auth "${2:-status}" ;;
     set-token)          do_set_token ;;
     doctor)             do_doctor ;;
     autotune)           do_autotune ;;
