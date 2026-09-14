@@ -15,6 +15,7 @@ CFD_DIR=$BASE/cloudflared
 XRAY_DIR=$BASE/xray
 LOGFILE=/var/log/xe3000-fulltunnel.log
 API=https://api.cloudflare.com/client/v4
+UPDATE_BASE=${FULLTUNNEL_UPDATE_BASE:-https://raw.githubusercontent.com/eprofdev/sub/main/xe3000}
 UI_PORT=9000            # مدخل HTTP، يحوّل إلى HTTPS
 UI_PORT_S=9443          # منفذ HTTPS الفعلي
 SELF=$0
@@ -2157,9 +2158,17 @@ _c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://\$H/" 2>/dev
 case "\$_c" in
     2*|4*) exit 0 ;;
 esac
-logger -t xe3000 "watchdog: المسار العام ردّ '\$_c' — إعادة تشغيل الخدمتين"
+logger -t xe3000 "watchdog: المسار العام ردّ '\$_c' — إصلاح ذاتي ثم إعادة تشغيل"
+# الإصلاح الذاتي أولًا: قد يكون العطل معروفًا ولا يحتاج إعادة تشغيل عمياء
+sh $SELF_ABS doctor >/dev/null 2>&1
 /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1
 /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
+sleep 5
+_c2=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://\$H/" 2>/dev/null)
+case "\$_c2" in
+    2*|4*) logger -t xe3000 "watchdog: عاد للعمل (\$_c2)" ;;
+    *)     logger -t xe3000 "watchdog: ما زال معطلًا (\$_c2)" ;;
+esac
 WDOG
     chmod 750 "$BASE/watchdog.sh"
 }
@@ -2232,6 +2241,142 @@ do_vpn_bypass() {
     esac
 }
 
+# ════════════════ الإصلاح الذاتي ════════════════
+# كل فحص يعرف عطلًا واجهناه فعلًا، ويعرف كيف يُصلحه بلا تدخّل.
+doctor_fix() { _fixed=$(( ${_fixed:-0} + 1 )); warn "أُصلح: $1"; }
+
+do_doctor() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
+    _fixed=0; _left=0
+
+    # 1) ملف خدمة xray بلا GODEBUG: مستمعو Go يُفتحون بـ MPTCP فلا تكتمل المصافحة
+    if ! grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null; then
+        write_init && enable_services >/dev/null 2>&1
+        doctor_fix "ملف الخدمة يضبط GODEBUG=multipathtcp=0"
+    fi
+
+    # 2) TCP Fast Open: يُنتج طلبات اتصال بعناوين مصفّرة على هذه النواة
+    _f=/proc/sys/net/ipv4/tcp_fastopen
+    if [ -w "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" != 0 ]; then
+        disable_tfo >/dev/null 2>&1; doctor_fix "TCP Fast Open معطّل"
+    fi
+
+    # 3) نسخة uhttpd قديمة تحجز منفذ اللوحة
+    if uci -q show uhttpd 2>/dev/null | grep -q 'xe3000-fulltunnel-bootstrap'; then
+        drop_legacy_uhttpd; doctor_fix "أُزيلت نسخة uhttpd قديمة"
+    fi
+
+    # 4) اللوحة مفقودة أو بلا مولّد QR (ترقية لم تُحدّث الصفحات)
+    if [ ! -f "$UIROOT/cgi-bin/control.cgi" ] ||
+       ! grep -q 'QR = (function' "$UIROOT/cgi-bin/control.cgi" 2>/dev/null; then
+        write_ui_files >/dev/null 2>&1
+        FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 || true
+        doctor_fix "أُعيد بناء صفحات اللوحة"
+    fi
+
+    # 5) قاعدة الجدار الناري للوحة
+    uci -q get firewall.xe3000_panel >/dev/null 2>&1 ||
+        { FULLTUNNEL_RESTORE_UI=1 configure_uhttpd >/dev/null 2>&1 &&
+          doctor_fix "أُعيدت قاعدة الجدار الناري للوحة"; }
+
+    # 6) كِل‑سويتش VPN موجود بلا تجاوز لمرور cloudflared
+    if ip rule show 2>/dev/null | grep -q blackhole && [ ! -f "$BASE/firewall.sh" ]; then
+        do_vpn_bypass on >/dev/null 2>&1 && doctor_fix "فُعّل تجاوز كِل‑سويتش VPN"
+    fi
+
+    # 7) ناقل ws فوق مقبس Unix: cloudflared لا يمرّر الترقية إلى أصل unix
+    if is_sock && [ "${XRAY_NET:-ws}" = ws ]; then
+        err "ws فوق مقبس Unix لا يعمل — بدّل الناقل أو العنوان."
+        say "    sh $SELF set-transport xhttp   أو   sh $SELF set-listen 127.0.0.1"
+        _left=$(( _left + 1 ))
+    fi
+
+    # 8) خدمة متوقفة
+    for _s in xe3000-cf-xray xe3000-cf-tunnel; do
+        [ -x /etc/init.d/$_s ] || continue
+        /etc/init.d/$_s running >/dev/null 2>&1 ||
+            { /etc/init.d/$_s restart >/dev/null 2>&1; doctor_fix "أُعيد تشغيل $_s"; }
+    done
+
+    say ""
+    [ "$_fixed" = 0 ] && ok "لا شيء يحتاج إصلاحًا." || ok "أُصلح $_fixed بندًا."
+    [ "$_left" = 0 ] || warn "بقي $_left بندًا يحتاج قرارك."
+    return 0
+}
+
+# ════════════════ الضبط الذاتي ════════════════
+# يجرّب التركيبات الممكنة ويُبقي أول ما ينجح — بلا تدخّل.
+tune_probe() {   # ينجح إن ردّ الأصل محليًا وعبر Cloudflare
+    sleep 3
+    if is_sock; then
+        _a=$(_probe "http://localhost$XRAY_WSPATH")
+    else
+        _a=$(_probe "http://$XRAY_LISTEN:$XRAY_PORT$XRAY_WSPATH")
+    fi
+    case "$_a" in *400*|*101*|*404*) : ;; *) return 1 ;; esac
+    _b=$(ws_probe "https://$CF_HOSTNAME$XRAY_WSPATH")
+    case "$_b" in *101*) return 0 ;; esac
+    # xhttp لا يستعمل الترقية: يكفي ردّ عادي من الأصل عبر الحافة
+    [ "${XRAY_NET:-ws}" = xhttp ] &&
+        { _c=$(_probe "https://$CF_HOSTNAME/"); case "$_c" in *404*|*400*) return 0 ;; esac; }
+    return 1
+}
+
+do_autotune() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    _o_listen=$XRAY_LISTEN; _o_net=$XRAY_NET; _o_port=$XRAY_PORT
+    say "يجرّب التركيبات حتى تعمل السلسلة — قد يستغرق دقيقة."
+    for _combo in "127.0.0.1 ws" "$(lan_ip) ws" "/var/run/xe3000-xray.sock xhttp" "127.0.0.1 xhttp"; do
+        XRAY_LISTEN=${_combo%% *}; XRAY_NET=${_combo##* }
+        say ""
+        say "── تجربة: $(mask "$XRAY_LISTEN") / $XRAY_NET ──"
+        save_settings
+        users_apply >/dev/null 2>&1
+        write_cfd_config
+        /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
+        if tune_probe; then
+            ok "نجحت: $(mask "$XRAY_LISTEN") / $XRAY_NET — حُفظت."
+            users_links
+            return 0
+        fi
+        say "    لم تنجح."
+    done
+    XRAY_LISTEN=$_o_listen; XRAY_NET=$_o_net; XRAY_PORT=$_o_port
+    save_settings; users_apply >/dev/null 2>&1; write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
+    err "لم تنجح أي تركيبة — أُعيد الإعداد السابق."
+    say "شغّل: sh $SELF selftest   وأرسل الناتج."
+    return 1
+}
+
+# ════════════════ التحديث الذاتي ════════════════
+do_selfupdate() {
+    need_root
+    need_cmd curl; need_cmd sha256sum
+    _t=/tmp/.xe3000up.$$; mkdir -p "$_t" || die "تعذر إنشاء مجلد مؤقت"
+    curl -fsSL --max-time 120 "$UPDATE_BASE/xe3000autouiinput.sh" -o "$_t/new.sh" ||
+        { rm -rf "$_t"; die "تعذر تنزيل النسخة الجديدة من $UPDATE_BASE"; }
+    curl -fsSL --max-time 60 "$UPDATE_BASE/SHA256SUMS" -o "$_t/sums" ||
+        { rm -rf "$_t"; die "تعذر تنزيل ملف البصمات"; }
+    _want=$(awk '$2=="xe3000autouiinput.sh"{print $1}' "$_t/sums")
+    _got=$(sha256sum "$_t/new.sh" | cut -d' ' -f1)
+    [ -n "$_want" ] || { rm -rf "$_t"; die "لا بصمة للسكربت في SHA256SUMS"; }
+    [ "$_want" = "$_got" ] || { rm -rf "$_t"; die "البصمة لا تطابق — أُلغي التحديث."; }
+    sh -n "$_t/new.sh" || { rm -rf "$_t"; die "النسخة الجديدة بها خطأ صياغة — أُلغي التحديث."; }
+    _nv=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$_t/new.sh" | head -1)
+    if [ "$_nv" = "$VERSION" ]; then
+        rm -rf "$_t"; ok "أنت على أحدث نسخة ($VERSION)."; return 0
+    fi
+    cp "$SELF_ABS" "$SELF_ABS.bak" 2>/dev/null
+    cat "$_t/new.sh" >"$SELF_ABS" || { rm -rf "$_t"; die "تعذر استبدال السكربت"; }
+    chmod 755 "$SELF_ABS"; rm -rf "$_t"
+    ok "حُدّث: $VERSION ← $_nv   (نسخة احتياطية: $SELF_ABS.bak)"
+    say "يطبّق التغييرات الآن…"
+    sh "$SELF_ABS" doctor
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -2253,6 +2398,9 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
   sh $SELF vpn-bypass on|off  تجاوز كِل‑سويتش WireGuard
+  sh $SELF doctor           يكتشف الأعطال المعروفة ويُصلحها تلقائيًا
+  sh $SELF autotune         يجرّب التركيبات ويُبقي ما ينجح
+  sh $SELF selfupdate       يحدّث نفسه بعد تحقق البصمة ثم يطبّق
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -2283,6 +2431,9 @@ case "${1:-}" in
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     set-token)          do_set_token ;;
+    doctor)             do_doctor ;;
+    autotune)           do_autotune ;;
+    selfupdate)         do_selfupdate ;;
     selftest)           do_selftest ;;
     set-listen)         do_set_listen "${2:-}" ;;
     set-transport)      do_set_transport "${2:-}" ;;
