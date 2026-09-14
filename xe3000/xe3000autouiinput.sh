@@ -473,7 +473,9 @@ write_xray_config() {
         rm -f "$XRAY_LISTEN"
     else
         _addr="\"listen\": \"$XRAY_LISTEN\", \"port\": $XRAY_PORT,"
-        _sock=
+        # TCP Fast Open معطّل صراحةً: نواة هذا الجهاز تُنشئ طلبات اتصال
+        # بعناوين مصفّرة معه، فلا تكتمل المصافحة أبدًا.
+        _sock=', "sockopt": { "tcpFastOpen": false }'
     fi
     # xhttp لا يستعمل ترقية HTTP، فيمرّ عبر cloudflared إلى أصل unix بخلاف ws
     case "${XRAY_NET:-ws}" in
@@ -637,7 +639,25 @@ load_settings() {
 }
 
 # ----------------------------------------------------------------- [5/6] التشغيل
+# نواة هذا الجهاز تُنتج طلبات اتصال بعناوين صفرية حين يكون TFO فعّالًا
+disable_tfo() {
+    _f=/proc/sys/net/ipv4/tcp_fastopen
+    [ -w "$_f" ] || return 0
+    _cur=$(cat "$_f" 2>/dev/null)
+    [ "$_cur" = 0 ] && return 0
+    echo 0 >"$_f" 2>/dev/null && ok "عُطّل TCP Fast Open (كان $_cur)"
+    # التثبيت بعد إعادة التشغيل
+    if [ -d /etc/sysctl.d ]; then
+        printf 'net.ipv4.tcp_fastopen=0\n' >/etc/sysctl.d/99-xe3000-tfo.conf
+    elif [ -f /etc/sysctl.conf ]; then
+        grep -q '^net.ipv4.tcp_fastopen' /etc/sysctl.conf 2>/dev/null ||
+            printf 'net.ipv4.tcp_fastopen=0\n' >>/etc/sysctl.conf
+    fi
+    return 0
+}
+
 enable_services() {
+    disable_tfo
     for s in xe3000-cf-xray xe3000-cf-tunnel; do
         /etc/init.d/$s enable  >/dev/null 2>&1
         /etc/init.d/$s restart >/dev/null 2>&1 || warn "تعذر تشغيل $s"
@@ -1946,6 +1966,7 @@ do_set_listen() {
     esac
     XRAY_LISTEN=$_a
     save_settings
+    disable_tfo
     users_apply
     write_cfd_config
     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
@@ -1971,6 +1992,7 @@ do_set_port() {
     is_sock && { warn "الاستماع على مقبس Unix — المنفذ غير مستعمل."; \
                  say "بدّل أولًا: sh $SELF set-listen 127.0.0.1"; }
     save_settings
+    disable_tfo
     users_apply
     write_cfd_config
     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
