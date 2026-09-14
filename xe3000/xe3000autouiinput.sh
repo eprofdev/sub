@@ -1535,7 +1535,7 @@ do_menu() {
             2) menu_users ;;
             3) users_links ;;
             4) menu_services ;;
-            5) do_diagnose ;;
+            5) do_diagnose; say ""; do_selftest || true ;;
             6) do_set_token || true ;;
             7) need_root; set_password 1 && configure_uhttpd ;;
             8) say "https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi" ;;
@@ -1594,6 +1594,105 @@ install_launchers() {
     fi
 }
 
+# ----------------------------------------------------------------- فحص السلسلة
+# يتتبع المسار كاملًا: xray ← cloudflared ← حافة Cloudflare ← DNS ← الطلب العام
+do_selftest() {
+    load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
+    need_cmd curl
+    _fail=0
+
+    say "── 1) الخدمتان ──"
+    for _s in xe3000-cf-xray xe3000-cf-tunnel; do
+        if [ -x /etc/init.d/$_s ] && /etc/init.d/$_s running >/dev/null 2>&1; then
+            ok "$_s يعمل"
+        else
+            err "$_s متوقف"; _fail=1
+        fi
+    done
+
+    say ""
+    say "── 2) xray يستمع محليًا ──"
+    if netstat -ltn 2>/dev/null | grep -q "127.0.0.1:$XRAY_PORT "; then
+        ok "المنفذ $XRAY_PORT مفتوح على 127.0.0.1"
+    else
+        err "المنفذ $XRAY_PORT غير مفتوح — xray لم يبدأ أو الإعداد خاطئ."
+        say "    logread | grep xray | tail -20"
+        _fail=1
+    fi
+
+    say ""
+    say "── 3) مصافحة WebSocket محليًا ──"
+    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+         -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+         -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
+         "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH" 2>/dev/null)
+    case "$_c" in
+        101) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
+        000) err "لا استجابة من xray على $XRAY_WSPATH"; _fail=1 ;;
+        *)   warn "xray ردّ $_c على $XRAY_WSPATH (المتوقع 101)" ;;
+    esac
+
+    say ""
+    say "── 4) اتصالات النفق لدى Cloudflare ──"
+    if creds_saved && [ -n "$TUNNEL_ID" ]; then
+        load_creds
+        _r=$(cf GET "/accounts/$CF_ACCOUNT/cfd_tunnel/$TUNNEL_ID")
+        if cf_success "$_r"; then
+            _st=$(jf "$_r" '@.result.status')
+            case "$_st" in
+                healthy) ok "حالة النفق: healthy" ;;
+                degraded) warn "حالة النفق: degraded — بعض الاتصالات ساقطة" ;;
+                down|inactive|'') err "حالة النفق: ${_st:-غير معروفة} — cloudflared لا يصل إلى الحافة."
+                                  say "    logread | grep cloudflared | tail -30"; _fail=1 ;;
+                *) say "    حالة النفق: $_st" ;;
+            esac
+        else
+            warn "تعذر الاستعلام عن النفق: $(cf_errors "$_r")"
+        fi
+    else
+        warn "لا بيانات محفوظة — تُخطّى هذه الخطوة."
+    fi
+
+    say ""
+    say "── 5) DNS للمضيف ──"
+    if nslookup "$CF_HOSTNAME" >/dev/null 2>&1; then
+        ok "$CF_HOSTNAME يُحوّل"
+    else
+        err "$CF_HOSTNAME لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
+        _fail=1
+    fi
+
+    say ""
+    say "── 6) الطلب العام عبر Cloudflare ──"
+    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$CF_HOSTNAME/" 2>/dev/null)
+    case "$_c" in
+        404) ok "الحافة تصل إلى cloudflared (404 من ingress هو المتوقع للجذر)" ;;
+        530) err "خطأ 530 — DNS يشير إلى النفق لكن لا اتصال نشط من cloudflared."; _fail=1 ;;
+        000) err "لا استجابة من https://$CF_HOSTNAME/"; _fail=1 ;;
+        *)   say "    الحافة ردّت $_c" ;;
+    esac
+
+    say ""
+    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+         -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+         -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
+         "https://$CF_HOSTNAME$XRAY_WSPATH" 2>/dev/null)
+    case "$_c" in
+        101) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل." ;;
+        404) err "الحافة ترد 404 على المسار — تحقق من تطابق path في إعداد العميل."; _fail=1 ;;
+        *)   warn "المسار العام ردّ $_c (المتوقع 101)"; _fail=1 ;;
+    esac
+
+    say ""
+    if [ "$_fail" = 0 ]; then
+        ok "كل الحلقات سليمة. إن فشل التطبيق فالخلل في إعداد العميل:"
+        users_links
+    else
+        err "انقطاع في السلسلة — أول سطر أحمر أعلاه هو موضعه."
+    fi
+    return $_fail
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -1608,6 +1707,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
+  sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
   sh $SELF user-add [اسم]   إضافة مستخدم وتطبيقه
@@ -1636,6 +1736,7 @@ case "${1:-}" in
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     set-token)          do_set_token ;;
+    selftest)           do_selftest ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;

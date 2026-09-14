@@ -130,6 +130,29 @@ sh /root/xe3000autouiinput.sh install
 
 ---
 
+## الاتصال لا يعمل — أين تنقطع السلسلة؟
+
+```sh
+sh /root/xe3000autouiinput.sh selftest
+```
+
+يتتبع المسار حلقة حلقة ويتوقف أول سطر أحمر عند موضع العطل:
+
+| الحلقة | ما تعنيه إن سقطت |
+|---|---|
+| 1 الخدمتان | xray أو cloudflared لا يعمل — `logread \| grep -E 'xray\|cloudflared'` |
+| 2 المنفذ المحلي | xray لم يبدأ أو إعداده خاطئ |
+| 3 مصافحة WS محليًا | المسار في الإعداد لا يطابق ما يستمع إليه xray |
+| 4 حالة النفق | cloudflared لا يصل إلى حافة Cloudflare |
+| 5 DNS | سجل CNAME مفقود أو لم ينتشر |
+| 6 الطلب العام | 530 = لا اتصال نشط · 404 على المسار = تعارض path |
+
+> **تنبيه على `logread -e xe3000`:** `-e` يرشّح بالنص، و«xe3000» لا يظهر إلا في سطور
+> المسارات، فتُحجب كل سطور cloudflared المهمة. استخدم:
+> `logread | grep -E 'xray|cloudflared' | tail -40`
+
+---
+
 ## لوحة 9000 لا تفتح
 
 ```sh
@@ -219,6 +242,7 @@ sh xe3000autouiinput.sh diagnose         # فحص uhttpd والمنفذ 9000
 sh xe3000autouiinput.sh repair-ui        # إصلاح ربط HTTPS على LAN
 sh xe3000autouiinput.sh set-password     # كلمة مرور اللوحة
 sh xe3000autouiinput.sh set-token        # تبديل توكن Cloudflare وحده ثم فحصه
+sh xe3000autouiinput.sh selftest         # فحص السلسلة كاملة
 sh xe3000autouiinput.sh menu             # قائمة تفاعلية عبر SSH
 sh xe3000autouiinput.sh user-list        # عرض المستخدمين
 sh xe3000autouiinput.sh user-add [اسم]   # إضافة مستخدم
