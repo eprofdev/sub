@@ -36,6 +36,18 @@ err()  { printf '[ER] %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 step() { printf '[%s/6] %s\n' "$1" "$2"; }
 
+# الناتج التشخيصي يُلصق كثيرًا في محادثات ومنتديات: نُخفي ما يعرّف التثبيت.
+# FULLTUNNEL_SHOW_SECRETS=1 يُظهرها، وأمر links يطبع الروابط كاملة دائمًا.
+mask() {
+    _v=${1:-}
+    [ -n "$_v" ] || { printf '(فارغ)'; return 0; }
+    [ "${FULLTUNNEL_SHOW_SECRETS:-0}" = 1 ] && { printf '%s' "$_v"; return 0; }
+    _n=${#_v}
+    if [ "$_n" -le 6 ]; then printf '******'
+    else printf '%s…%s' "$(printf '%s' "$_v" | cut -c1-4)" "$(printf '%s' "$_v" | cut -c$((_n-1))-)"
+    fi
+}
+
 need_root() {
     [ "$(id -u)" = 0 ] || die "يجب التشغيل بصلاحية root."
 }
@@ -131,7 +143,7 @@ forget_creds() {
 creds_status() {
     if creds_saved; then
         say "بيانات Cloudflare: محفوظة"
-        say "  المضيف     : $(cat "$CREDS/hostname")"
+        say "  المضيف     : $(mask "$(cat "$CREDS/hostname")")"
         say "  الحساب     : $(cat "$CREDS/account-id" | cut -c1-8)…"
         say "  النطاق     : $(cat "$CREDS/zone-id" | cut -c1-8)…"
         say "  التوكن     : محفوظ (لا يُعرض)"
@@ -251,7 +263,7 @@ preflight_cloudflare() {
     _r=$(cf GET "/zones/$CF_ZONE")
     if cf_success "$_r"; then
         _zn=$(jf "$_r" '@.result.name')
-        ok "3/4 النطاق: $_zn"
+        ok "3/4 النطاق: $(mask "$_zn")"
         case "$CF_HOSTNAME" in
             "$_zn"|*".$_zn") : ;;
             *) err "3/4 المضيف '$CF_HOSTNAME' ليس تابعًا للنطاق '$_zn'."; _fail=1 ;;
@@ -557,7 +569,7 @@ create_tunnel() {
     cf_success "$_r" || die "فشل إنشاء النفق: $(cf_errors "$_r")"
     TUNNEL_ID=$(jf "$_r" '@.result.id')
     [ -n "$TUNNEL_ID" ] || die "استجابة Cloudflare بلا معرّف نفق."
-    ok "أُنشئ النفق $TUNNEL_NAME ($TUNNEL_ID)"
+    ok "أُنشئ النفق $(mask "$TUNNEL_NAME") ($(mask "$TUNNEL_ID"))"
 }
 
 create_or_update_dns() {
@@ -575,7 +587,7 @@ create_or_update_dns() {
         _act="أُنشئ"
     fi
     cf_success "$_r" || die "فشل سجل DNS: $(cf_errors "$_r")"
-    ok "$_act سجل CNAME: $CF_HOSTNAME ← $_content"
+    ok "$_act سجل CNAME: $(mask "$CF_HOSTNAME") ← $(mask "$_content")"
 }
 
 # ----------------------------------------------------------------- [4/6] ملفات الإعداد
@@ -1459,8 +1471,8 @@ do_status() {
         return 1
     fi
     say "الإصدار    : $VERSION"
-    say "المضيف     : $CF_HOSTNAME"
-    say "النفق      : $TUNNEL_NAME ($TUNNEL_ID)"
+    say "المضيف     : $(mask "$CF_HOSTNAME")"
+    say "النفق      : $(mask "$TUNNEL_NAME") ($(mask "$TUNNEL_ID"))"
     for s in xe3000-cf-xray xe3000-cf-tunnel; do
         if [ -x /etc/init.d/$s ] && /etc/init.d/$s running >/dev/null 2>&1; then
             say "$s : يعمل"
@@ -1644,7 +1656,7 @@ do_menu() {
         printf '\n'
         say "══════ XE3000 Full-Tunnel ══════"
         if load_settings 2>/dev/null; then
-            say "  المضيف: $CF_HOSTNAME    المستخدمون: $(users_count)"
+            say "  المضيف: $(mask "$CF_HOSTNAME")    المستخدمون: $(users_count)"
             say "  xray: $(/etc/init.d/xe3000-cf-xray running >/dev/null 2>&1 && echo يعمل || echo متوقف)   cloudflared: $(/etc/init.d/xe3000-cf-tunnel running >/dev/null 2>&1 && echo يعمل || echo متوقف)"
         else
             say "  غير مثبت"
@@ -1773,6 +1785,8 @@ check_offload() {
 }
 
 do_selftest() {
+    [ "${FULLTUNNEL_SHOW_SECRETS:-0}" = 1 ] ||
+        say "(القيم المعرِّفة مخفية — FULLTUNNEL_SHOW_SECRETS=1 لإظهارها)"
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
     _fail=0
@@ -1814,8 +1828,8 @@ do_selftest() {
         _cpr=$(jf "$_j" '@.inbounds[0].protocol')
         say "    protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
         _cw=${_cw:-$(jf "$_j" '@.inbounds[0].streamSettings.xhttpSettings.path')}
-        say "    path في config.json : $_cw"
-        say "    path في settings.env: $XRAY_WSPATH"
+        say "    path في config.json : $(mask "$_cw")"
+        say "    path في settings.env: $(mask "$XRAY_WSPATH")"
         case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
         [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
         is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
@@ -1978,9 +1992,9 @@ do_selftest() {
     say ""
     say "── 5) DNS للمضيف ──"
     if nslookup "$CF_HOSTNAME" >/dev/null 2>&1; then
-        ok "$CF_HOSTNAME يُحوّل"
+        ok "$(mask "$CF_HOSTNAME") يُحوّل"
     else
-        err "$CF_HOSTNAME لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
+        err "$(mask "$CF_HOSTNAME") لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
         _fail=1
     fi
 
@@ -1991,7 +2005,7 @@ do_selftest() {
         404) ok "الحافة تصل إلى cloudflared (404 من ingress هو المتوقع للجذر)" ;;
         530) err "خطأ 530 — DNS يشير إلى النفق لكن لا اتصال نشط من cloudflared."; _fail=1 ;;
         000|curl*)
-            warn "الراوتر نفسه لم يصل إلى https://$CF_HOSTNAME/ ($_e)"
+            warn "الراوتر نفسه لم يصل إلى المضيف العام ($_e)"
             say  "    كثيرًا ما يعجز الراوتر عن طلب مضيفه العام من الداخل؛"
             say  "    جرّبه من الهاتف أو حاسوب خارج الشبكة قبل عدّه عطلًا." ;;
         *)   say "    الحافة ردّت $_e" ;;
