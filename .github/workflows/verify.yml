@@ -53,6 +53,21 @@ jobs:
           fi
           echo "no reflected input"
 
+      - name: QR library injected into the panel
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          sudo sh "$T/x.sh" ui-only || true
+          sudo chmod -R a+rX "$T"
+          grep -q 'QR = (function' "$T/base/ui/cgi-bin/control.cgi"
+          ! grep -q '@QRLIB@' "$T/base/ui/cgi-bin/control.cgi"
+          ! grep -q '@SELF@' "$T/base/ui/cgi-bin/control.cgi"
+          ! grep -q '@SELF@' "$T/base/ui/cgi-bin/setup.cgi"
+          echo "qr library injected, placeholders resolved"
+
       - name: SHA256SUMS matches tracked files
         run: sha256sum -c SHA256SUMS
 

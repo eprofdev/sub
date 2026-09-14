@@ -332,6 +332,101 @@ prepare_runtime() {
     ok "الاعتمادات جاهزة"
 }
 
+# ----------------------------------------------------------------- المستخدمون
+USERS=$STATE/users.tsv     # سطر لكل مستخدم: uuid<TAB>الاسم
+
+users_init() {
+    mkdir -p "$STATE"
+    [ -f "$USERS" ] || { : >"$USERS"; chmod 600 "$USERS"; }
+}
+
+users_count() { users_init; grep -c . "$USERS" 2>/dev/null || echo 0; }
+
+users_list() {
+    users_init
+    [ -s "$USERS" ] || { say "لا يوجد مستخدمون."; return 0; }
+    _i=0
+    while IFS="$(printf '\t')" read -r _u _n; do
+        [ -n "$_u" ] || continue
+        _i=$((_i+1))
+        printf '%2d) %-20s %s\n' "$_i" "$_n" "$_u"
+    done <"$USERS"
+}
+
+user_name_free() {
+    users_init
+    ! awk -F'\t' -v n="$1" '$2==n{found=1} END{exit !found}' "$USERS" 2>/dev/null
+}
+
+user_add() { # $1 الاسم (اختياري)
+    users_init
+    _n=${1:-}
+    [ -n "$_n" ] || _n="user$(( $(users_count) + 1 ))"
+    case "$_n" in *[!A-Za-z0-9_.-]*) die "اسم غير صالح: استخدم حروفًا وأرقامًا و . _ - فقط." ;; esac
+    user_name_free "$_n" || die "الاسم '$_n' مستخدم بالفعل."
+    _u=$(cat /proc/sys/kernel/random/uuid)
+    printf '%s\t%s\n' "$_u" "$_n" >>"$USERS"
+    chmod 600 "$USERS"
+    ok "أُضيف المستخدم $_n"
+    printf '%s' "$_u"
+}
+
+user_del() { # $1 اسم أو uuid
+    users_init
+    _k=${1:-}
+    [ -n "$_k" ] || die "حدّد اسم المستخدم أو معرّفه."
+    _tmp=$STATE/.users.$$
+    awk -F'\t' -v k="$_k" '$1!=k && $2!=k' "$USERS" >"$_tmp" || { rm -f "$_tmp"; die "فشل التحرير."; }
+    if cmp -s "$USERS" "$_tmp"; then rm -f "$_tmp"; die "لا يوجد مستخدم بهذا الاسم أو المعرّف: $_k"; fi
+    mv "$_tmp" "$USERS"; chmod 600 "$USERS"
+    ok "حُذف المستخدم $_k"
+}
+
+user_link() { # $1 uuid  $2 الاسم
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s' \
+        "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "$CF_HOSTNAME" \
+        "$(printf '%s' "$XRAY_WSPATH" | sed 's|/|%2F|g')" "$2"
+}
+
+users_links() {
+    load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
+    users_init
+    [ -s "$USERS" ] || { say "لا يوجد مستخدمون."; return 0; }
+    while IFS="$(printf '\t')" read -r _u _n; do
+        [ -n "$_u" ] || continue
+        say ""
+        say "[$_n]"
+        user_link "$_u" "$_n"; say ""
+    done <"$USERS"
+}
+
+# يعيد بناء عملاء xray من ملف المستخدمين ثم يعيد تشغيل الخدمة
+users_apply() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    users_init
+    [ -s "$USERS" ] || die "لا يمكن ترك القائمة فارغة — أضف مستخدمًا أولًا."
+    _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
+    cat >"$XRAY_DIR/config.json" <<XRAYCFG
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": $XRAY_PORT,
+      "protocol": "vless",
+      "settings": { "clients": [ $_clients ], "decryption": "none" },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "$XRAY_WSPATH" } }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+}
+XRAYCFG
+    chmod 600 "$XRAY_DIR/config.json"
+    /etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل xray"
+    ok "طُبّقت القائمة ($(users_count) مستخدم)"
+}
+
 # ----------------------------------------------------------------- [3/6] النفق و DNS
 create_tunnel() {
     TUNNEL_NAME=${FULLTUNNEL_TUNNEL_NAME:-xe3000-$(printf '%s' "$CF_HOSTNAME" | tr '.' '-')}
@@ -382,8 +477,16 @@ write_configs() {
     chmod 600 "$BASE/tunnel/$TUNNEL_ID.json"
 
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
-    XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
+    users_init
+    if [ ! -s "$USERS" ]; then
+        XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}
+        printf '%s\t%s\n' "$XRAY_UUID" "${FULLTUNNEL_USER:-user1}" >"$USERS"
+        chmod 600 "$USERS"
+    else
+        XRAY_UUID=$(awk -F'\t' 'NF{print $1; exit}' "$USERS")
+    fi
+    _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
 
     cat >"$CFD_DIR/config.yml" <<CFDCFG
 tunnel: $TUNNEL_ID
@@ -407,7 +510,7 @@ CFDCFG
       "port": $XRAY_PORT,
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "$XRAY_UUID" } ],
+        "clients": [ $_clients ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -508,6 +611,252 @@ enable_services() {
 }
 
 # ----------------------------------------------------------------- [6/6] لوحة 9000
+# مولّد QR مضمّن — بلا أي اعتماد خارجي أو CDN
+write_qrlib() {
+    cat >"$UIROOT/qr.js" <<'QRLIB'
+// مولّد QR — وضع البايت، مستوى تصحيح L، الإصدارات 1..15. بلا اعتمادات.
+var QR = (function () {
+  var EXP = [], LOG = [];
+  (function () {
+    var x = 1;
+    for (var i = 0; i < 256; i++) { EXP[i] = x; x <<= 1; if (x & 256) x ^= 0x11d; }
+    for (var j = 0; j < 255; j++) LOG[EXP[j]] = j;
+  })();
+  function mul(a, b) { return (a === 0 || b === 0) ? 0 : EXP[(LOG[a] + LOG[b]) % 255]; }
+
+  // [إجمالي رموز البيانات, رموز التصحيح لكل كتلة, [ [عدد الكتل, رموز بيانات الكتلة], ... ] ]
+  var L = {
+    1:[19,7,[[1,19]]],           2:[34,10,[[1,34]]],          3:[55,15,[[1,55]]],
+    4:[80,20,[[1,80]]],          5:[108,26,[[1,108]]],        6:[136,18,[[2,68]]],
+    7:[156,20,[[2,78]]],         8:[194,24,[[2,97]]],         9:[232,30,[[2,116]]],
+    10:[274,18,[[2,68],[2,69]]], 11:[324,20,[[4,81]]],        12:[370,24,[[2,92],[2,93]]],
+    13:[428,26,[[4,107]]],       14:[461,30,[[3,115],[1,116]]],15:[523,22,[[5,87],[1,88]]]
+  };
+  var ALIGN = {
+    1:[],2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],
+    9:[6,26,46],10:[6,28,50],11:[6,30,54],12:[6,32,58],13:[6,34,62],
+    14:[6,26,46,66],15:[6,26,48,70]
+  };
+
+  function rsGen(n) {
+    var g = [1];
+    for (var i = 0; i < n; i++) {
+      var ng = new Array(g.length + 1).fill(0);
+      for (var j = 0; j < g.length; j++) {
+        ng[j] ^= g[j];                    // الضرب في x
+        ng[j + 1] ^= mul(g[j], EXP[i]);   // الضرب في α^i
+      }
+      g = ng;
+    }
+    return g;
+  }
+  function rsEnc(data, n) {
+    var g = rsGen(n), res = new Array(n).fill(0);
+    for (var i = 0; i < data.length; i++) {
+      var f = data[i] ^ res[0];
+      res.shift(); res.push(0);
+      if (f !== 0) for (var j = 0; j < n; j++) res[j] ^= mul(g[j + 1], f);
+    }
+    return res;
+  }
+
+  function utf8(str) {
+    var out = [], s = unescape(encodeURIComponent(str));
+    for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i));
+    return out;
+  }
+
+  function bch15(v) { var d = v << 10; while (Math.floor(Math.log2(d)) >= 10) d ^= 0x537 << (Math.floor(Math.log2(d)) - 10); return ((v << 10) | d) ^ 0x5412; }
+  function bch18(v) { var d = v << 12; while (Math.floor(Math.log2(d)) >= 12) d ^= 0x1f25 << (Math.floor(Math.log2(d)) - 12); return (v << 12) | d; }
+
+  function build(text) {
+    var bytes = utf8(text), ver = 0;
+    for (var v = 1; v <= 15; v++) {
+      var cap = L[v][0], ccBits = v < 10 ? 8 : 16;
+      if (bytes.length + 2 + Math.ceil(ccBits / 8) <= cap + 1 &&
+          (4 + ccBits + bytes.length * 8) <= cap * 8) { ver = v; break; }
+    }
+    if (!ver) throw new Error('النص أطول مما يتسع في الإصدار 15');
+
+    var totalData = L[ver][0], ecLen = L[ver][1], groups = L[ver][2];
+    var ccBits = ver < 10 ? 8 : 16;
+    var bits = [];
+    function put(val, n) { for (var i = n - 1; i >= 0; i--) bits.push((val >> i) & 1); }
+    put(4, 4); put(bytes.length, ccBits);
+    for (var i = 0; i < bytes.length; i++) put(bytes[i], 8);
+    var rem = totalData * 8 - bits.length;
+    put(0, Math.min(4, rem));
+    while (bits.length % 8) bits.push(0);
+    var pad = [0xEC, 0x11], pi = 0;
+    while (bits.length < totalData * 8) { put(pad[pi++ % 2], 8); }
+
+    var cw = [];
+    for (var i = 0; i < bits.length; i += 8) {
+      var b = 0; for (var j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+      cw.push(b);
+    }
+
+    var blocks = [], ecs = [], off = 0;
+    for (var g = 0; g < groups.length; g++) {
+      for (var k = 0; k < groups[g][0]; k++) {
+        var d = cw.slice(off, off + groups[g][1]); off += groups[g][1];
+        blocks.push(d); ecs.push(rsEnc(d, ecLen));
+      }
+    }
+    var maxD = 0; for (var i = 0; i < blocks.length; i++) maxD = Math.max(maxD, blocks[i].length);
+    var out = [];
+    for (var i = 0; i < maxD; i++) for (var b = 0; b < blocks.length; b++) if (i < blocks[b].length) out.push(blocks[b][i]);
+    for (var i = 0; i < ecLen; i++) for (var b = 0; b < ecs.length; b++) out.push(ecs[b][i]);
+    return { ver: ver, cw: out };
+  }
+
+  function matrix(ver) {
+    var n = ver * 4 + 17, m = [], f = [];
+    for (var i = 0; i < n; i++) { m.push(new Array(n).fill(0)); f.push(new Array(n).fill(0)); }
+    function set(r, c, v) { m[r][c] = v; f[r][c] = 1; }
+    function finder(r, c) {
+      for (var dr = -1; dr <= 7; dr++) for (var dc = -1; dc <= 7; dc++) {
+        var rr = r + dr, cc = c + dc;
+        if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+        var inner = (dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6);
+        var on = inner && (dr === 0 || dr === 6 || dc === 0 || dc === 6 ||
+                 (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4));
+        set(rr, cc, on ? 1 : 0);
+      }
+    }
+    finder(0, 0); finder(0, n - 7); finder(n - 7, 0);
+    for (var i = 8; i < n - 8; i++) { set(6, i, i % 2 === 0 ? 1 : 0); set(i, 6, i % 2 === 0 ? 1 : 0); }
+    var ap = ALIGN[ver];
+    for (var a = 0; a < ap.length; a++) for (var b = 0; b < ap.length; b++) {
+      var r = ap[a], c = ap[b];
+      if ((r <= 8 && c <= 8) || (r <= 8 && c >= n - 9) || (r >= n - 9 && c <= 8)) continue;
+      for (var dr = -2; dr <= 2; dr++) for (var dc = -2; dc <= 2; dc++)
+        set(r + dr, c + dc, (Math.abs(dr) === 2 || Math.abs(dc) === 2 || (dr === 0 && dc === 0)) ? 1 : 0);
+    }
+    for (var i = 0; i <= 8; i++) { if (!f[8][i]) set(8, i, 0); if (!f[i][8]) set(i, 8, 0); }
+    for (var i = n - 8; i < n; i++) { set(8, i, 0); set(i, 8, 0); }
+    set(n - 8, 8, 1);   // النقطة الداكنة — بعد الحجز حتى لا تُمسح
+    if (ver >= 7) for (var i = 0; i < 18; i++) {
+      var r = Math.floor(i / 3), c = i % 3;
+      set(n - 11 + c, r, 0); set(r, n - 11 + c, 0);
+    }
+    return { m: m, f: f, n: n };
+  }
+
+  function place(mm, cw) {
+    var m = mm.m, f = mm.f, n = mm.n, bi = 0, up = true;
+    for (var col = n - 1; col > 0; col -= 2) {
+      if (col === 6) col--;
+      for (var t = 0; t < n; t++) {
+        var row = up ? n - 1 - t : t;
+        for (var k = 0; k < 2; k++) {
+          var c = col - k;
+          if (f[row][c]) continue;
+          var bit = 0;
+          if (bi < cw.length * 8) bit = (cw[bi >> 3] >> (7 - (bi & 7))) & 1;
+          m[row][c] = bit; bi++;
+        }
+      }
+      up = !up;
+    }
+  }
+
+  function maskFn(k, r, c) {
+    switch (k) {
+      case 0: return (r + c) % 2 === 0;
+      case 1: return r % 2 === 0;
+      case 2: return c % 3 === 0;
+      case 3: return (r + c) % 3 === 0;
+      case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+      case 5: return (r * c) % 2 + (r * c) % 3 === 0;
+      case 6: return ((r * c) % 2 + (r * c) % 3) % 2 === 0;
+      case 7: return ((r + c) % 2 + (r * c) % 3) % 2 === 0;
+    }
+  }
+
+  function penalty(m, n) {
+    var p = 0, i, j, k;
+    for (i = 0; i < n; i++) {
+      for (var dir = 0; dir < 2; dir++) {
+        var run = 1, prev = dir ? m[0][i] : m[i][0];
+        for (j = 1; j < n; j++) {
+          var v = dir ? m[j][i] : m[i][j];
+          if (v === prev) { run++; } else { if (run >= 5) p += 3 + (run - 5); run = 1; prev = v; }
+        }
+        if (run >= 5) p += 3 + (run - 5);
+      }
+    }
+    for (i = 0; i < n - 1; i++) for (j = 0; j < n - 1; j++) {
+      var s = m[i][j] + m[i][j+1] + m[i+1][j] + m[i+1][j+1];
+      if (s === 0 || s === 4) p += 3;
+    }
+    var pat1 = [1,0,1,1,1,0,1,0,0,0,0], pat2 = [0,0,0,0,1,0,1,1,1,0,1];
+    for (i = 0; i < n; i++) for (j = 0; j + 10 < n; j++) {
+      var okH1 = true, okH2 = true, okV1 = true, okV2 = true;
+      for (k = 0; k < 11; k++) {
+        if (m[i][j+k] !== pat1[k]) okH1 = false;
+        if (m[i][j+k] !== pat2[k]) okH2 = false;
+        if (m[j+k][i] !== pat1[k]) okV1 = false;
+        if (m[j+k][i] !== pat2[k]) okV2 = false;
+      }
+      if (okH1) p += 40; if (okH2) p += 40; if (okV1) p += 40; if (okV2) p += 40;
+    }
+    var dark = 0;
+    for (i = 0; i < n; i++) for (j = 0; j < n; j++) dark += m[i][j];
+    var pct = dark * 100 / (n * n);
+    p += Math.floor(Math.abs(pct - 50) / 5) * 10;
+    return p;
+  }
+
+  function encode(text) {
+    var b = build(text), mm = matrix(b.ver), n = mm.n;
+    place(mm, b.cw);
+    var best = null, bestP = Infinity, bestK = 0;
+    for (var k = 0; k < 8; k++) {
+      var m = [];
+      for (var i = 0; i < n; i++) m.push(mm.m[i].slice());
+      for (var i = 0; i < n; i++) for (var j = 0; j < n; j++)
+        if (!mm.f[i][j] && maskFn(k, i, j)) m[i][j] ^= 1;
+      var fmt = bch15((1 << 3) | k);          // مستوى L = 01
+      for (var i = 0; i < 15; i++) {
+        var bit = (fmt >> i) & 1;
+        // النسخة العمودية على العمود 8
+        if (i < 6) m[i][8] = bit;
+        else if (i < 8) m[i + 1][8] = bit;
+        else m[n - 15 + i][8] = bit;
+        // النسخة الأفقية على الصف 8
+        if (i < 8) m[8][n - i - 1] = bit;
+        else if (i === 8) m[8][7] = bit;
+        else m[8][14 - i] = bit;
+      }
+      if (b.ver >= 7) {
+        var vi = bch18(b.ver);
+        for (var i = 0; i < 18; i++) {
+          var bit = (vi >> i) & 1, r = Math.floor(i / 3), c = i % 3;
+          m[n - 11 + c][r] = bit; m[r][n - 11 + c] = bit;
+        }
+      }
+      var p = penalty(m, n);
+      if (p < bestP) { bestP = p; best = m; bestK = k; }
+    }
+    return { size: n, modules: best, version: b.ver, mask: bestK };
+  }
+
+  function svg(text, scale, quiet) {
+    var q = qr = encode(text), n = q.size, s = scale || 4, qz = (quiet === undefined ? 4 : quiet);
+    var dim = (n + qz * 2) * s, d = '';
+    for (var r = 0; r < n; r++) for (var c = 0; c < n; c++)
+      if (q.modules[r][c]) d += 'M' + ((c + qz) * s) + ' ' + ((r + qz) * s) + 'h' + s + 'v' + s + 'h-' + s + 'z';
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + dim + '" height="' + dim +
+           '" viewBox="0 0 ' + dim + ' ' + dim + '" shape-rendering="crispEdges">' +
+           '<rect width="100%" height="100%" fill="#fff"/><path fill="#000" d="' + d + '"/></svg>';
+  }
+  return { encode: encode, svg: svg };
+})();
+if (typeof module !== 'undefined') module.exports = QR;
+QRLIB
+}
+
 write_ui_files() {
     mkdir -p "$UIROOT/cgi-bin"
     chmod 755 "$UIROOT" "$UIROOT/cgi-bin"
@@ -524,49 +873,69 @@ UIHTML
 BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
 SETTINGS=$BASE/state/settings.env
+USERS=$BASE/state/users.tsv
+INSTALLER='@SELF@'
 Q=${QUERY_STRING:-}
-arg() { printf '%s' "$Q" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+MSG=; CLS=msg
+
+dec() { printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%\(..\)/\\x\1/g')"; }
+arg() { printf '%s' "$BODY$Q" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+
+BODY=
+if [ "${REQUEST_METHOD:-GET}" = POST ] && [ -n "${CONTENT_LENGTH:-}" ]; then
+  BODY=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+fi
 ACT=$(arg action)
-case "$ACT" in
-  ''|start|stop|restart|forget) : ;;
-  *) ACT=invalid ;;
-esac
-MSG=
+case "$ACT" in ''|start|stop|restart|useradd|userdel|forget) : ;; *) ACT=invalid ;; esac
 
 installed() { [ -f "$SETTINGS" ] && [ -x /etc/init.d/xe3000-cf-tunnel ]; }
+run() { [ -f "$INSTALLER" ] && sh "$INSTALLER" "$@" 2>&1; }
 
 if [ -n "$ACT" ]; then
-  if ! installed; then
-    MSG="البوابة غير مثبتة — لا يمكن تنفيذ الأمر. شغّل المُثبّت على الراوتر أولًا."
+  if ! installed && [ "$ACT" != forget ]; then
+    MSG="البوابة غير مثبتة — لا يمكن تنفيذ الأمر."; CLS=err
   else
     case "$ACT" in
       start|stop|restart)
         /etc/init.d/xe3000-cf-xray   "$ACT" >/dev/null 2>&1
         /etc/init.d/xe3000-cf-tunnel "$ACT" >/dev/null 2>&1
-        MSG="نُفِّذ الأمر: $ACT" ;;
+        MSG="نُفِّذ الأمر: $ACT"; CLS=ok ;;
+      useradd)
+        N=$(dec "$(arg name)")
+        case "$N" in
+          '' ) MSG=$(run user-add); CLS=ok ;;
+          *[!A-Za-z0-9_.-]* ) MSG="اسم غير صالح — حروف وأرقام و . _ - فقط."; CLS=err ;;
+          * ) MSG=$(run user-add "$N"); CLS=ok ;;
+        esac ;;
+      userdel)
+        U=$(dec "$(arg uid)")
+        case "$U" in
+          ''|*[!A-Za-z0-9_.-]* ) MSG="معرّف غير صالح."; CLS=err ;;
+          * ) MSG=$(run user-del "$U"); CLS=ok ;;
+        esac ;;
       forget)
-        if [ "$(arg confirm)" = FORGET ]; then
-          rm -rf "$CREDS"; MSG="حُذفت بيانات Cloudflare المحفوظة."
-        else
-          MSG="لم تُحذف — يجب كتابة FORGET بالضبط."
-        fi ;;
-      *) MSG="أمر غير معروف." ;;
+        if [ "$(dec "$(arg confirm)")" = FORGET ]; then
+          rm -rf "$CREDS"; MSG="حُذفت بيانات Cloudflare المحفوظة."; CLS=ok
+        else MSG="لم تُحذف — يجب كتابة FORGET بالضبط."; CLS=err; fi ;;
     esac
   fi
 fi
 
 svc() {
   if [ -x "/etc/init.d/$1" ]; then
-    if /etc/init.d/"$1" running >/dev/null 2>&1; then printf 'يعمل'; else printf 'متوقف'; fi
-  else
-    printf 'غير مثبت'
-  fi
+    /etc/init.d/"$1" running >/dev/null 2>&1 && printf 'يعمل' || printf 'متوقف'
+  else printf 'غير مثبت'; fi
 }
 
-HOSTV=; TIDV=
-[ -f "$SETTINGS" ] && { HOSTV=$(sed -n 's/^FULLTUNNEL_HOSTNAME=//p' "$SETTINGS"); \
-                        TIDV=$(sed -n 's/^FULLTUNNEL_TUNNEL_ID=//p' "$SETTINGS"); }
-if [ -s "$CREDS/api-token" ]; then CRED=محفوظة; else CRED="غير محفوظة"; fi
+HOSTV=; TIDV=; PATHV=
+if [ -f "$SETTINGS" ]; then
+  HOSTV=$(sed -n 's/^FULLTUNNEL_HOSTNAME=//p' "$SETTINGS")
+  TIDV=$(sed -n 's/^FULLTUNNEL_TUNNEL_ID=//p' "$SETTINGS")
+  PATHV=$(sed -n 's/^FULLTUNNEL_XRAY_PATH=//p' "$SETTINGS")
+fi
+EPATH=$(printf '%s' "$PATHV" | sed 's|/|%2F|g')
+[ -s "$CREDS/api-token" ] && CRED=محفوظة || CRED="غير محفوظة"
 
 printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
 cat <<HTML
@@ -574,24 +943,39 @@ cat <<HTML
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>XE3000 Full-Tunnel</title>
 <style>
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px}
-.c{max-width:640px;margin:auto}h1{font-size:1.3rem}
-.card{background:#1e1e1e;border:1px solid #333;border-radius:8px;padding:14px;margin:12px 0}
-table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px solid #2a2a2a}
-a.btn{display:inline-block;background:#2d6cdf;color:#fff;text-decoration:none;
-padding:8px 14px;border-radius:6px;margin:4px 4px 0 0}
-.msg{background:#332b00;border:1px solid #7a6500;padding:10px;border-radius:6px}
-input{padding:6px;border-radius:4px;border:1px solid #444;background:#111;color:#eee}
+:root{--bg:#111;--card:#1c1c1c;--line:#333;--fg:#eee;--mut:#9a9a9a;--acc:#2d6cdf}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:16px}
+.c{max-width:720px;margin:auto}h1{font-size:1.25rem;margin:.2rem 0 1rem}
+h2{font-size:1rem;margin:0 0 .6rem;color:var(--mut);font-weight:600}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:12px 0}
+table{width:100%;border-collapse:collapse}td{padding:6px 2px;border-bottom:1px solid #2a2a2a}
+td:first-child{color:var(--mut);width:9rem}
+a.btn,button{display:inline-block;background:var(--acc);color:#fff;text-decoration:none;border:0;
+padding:8px 14px;border-radius:7px;margin:4px 0 0 6px;font-size:.92rem;cursor:pointer}
+button.sec{background:#444}button.del{background:#7a2020}
+.msg,.ok,.err{padding:10px;border-radius:7px;margin:10px 0;white-space:pre-wrap}
+.msg{background:#332b00;border:1px solid #7a6500}
+.ok{background:#0f2d16;border:1px solid #2a6b3a}
+.err{background:#3a1111;border:1px solid #7a2020}
+input{padding:8px;border-radius:6px;border:1px solid #444;background:#0d0d0d;color:var(--fg);font-size:.9rem}
+.u{border:1px solid var(--line);border-radius:9px;padding:12px;margin:10px 0;background:#161616}
+.uh{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.uh b{font-size:1.02rem}.uid{color:var(--mut);font-size:.78rem;word-break:break-all}
+.lk{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.lk input{flex:1 1 16rem;min-width:0;font-family:ui-monospace,monospace;font-size:.76rem}
+.qr{margin-top:10px;background:#fff;padding:8px;border-radius:8px;display:inline-block;line-height:0}
+.qr svg{display:block;width:180px;height:180px}
 .warn{color:#ff9a9a}
 </style><div class="c">
 <h1>XE3000 Cloudflare Full-Tunnel</h1>
 HTML
-[ -n "$MSG" ] && printf '<div class="msg">%s</div>' "$MSG"
+[ -n "$MSG" ] && { printf '<div class="%s">' "$CLS"; printf '%s' "$MSG" | esc; printf '</div>'; }
+
 if installed; then
 cat <<HTML
-<div class="card"><table>
+<div class="card"><h2>الحالة</h2><table>
 <tr><td>المضيف</td><td>$HOSTV</td></tr>
-<tr><td>معرّف النفق</td><td>$TIDV</td></tr>
+<tr><td>معرّف النفق</td><td class="uid">$TIDV</td></tr>
 <tr><td>xray</td><td>$(svc xe3000-cf-xray)</td></tr>
 <tr><td>cloudflared</td><td>$(svc xe3000-cf-tunnel)</td></tr>
 </table>
@@ -599,23 +983,80 @@ cat <<HTML
 <a class="btn" href="?action=stop">إيقاف</a>
 <a class="btn" href="?action=restart">إعادة تشغيل</a>
 </div>
+
+<div class="card"><h2>المستخدمون</h2>
+HTML
+  if [ -s "$USERS" ]; then
+    while IFS="$(printf '\t')" read -r U N; do
+      [ -n "$U" ] || continue
+      LINK="vless://$U@$HOSTV:443?encryption=none&security=tls&sni=$HOSTV&type=ws&host=$HOSTV&path=$EPATH#$N"
+      LE=$(printf '%s' "$LINK" | esc)
+      NE=$(printf '%s' "$N" | esc)
+      cat <<HTML
+<div class="u">
+  <div class="uh"><b>$NE</b>
+    <form method="post" onsubmit="return confirm('حذف $NE ؟')">
+      <input type="hidden" name="action" value="userdel">
+      <input type="hidden" name="uid" value="$U">
+      <button class="del">حذف</button></form>
+  </div>
+  <div class="uid">$U</div>
+  <div class="lk">
+    <input readonly value="$LE">
+    <button class="sec" onclick="cp(this)">نسخ الرابط</button>
+  </div>
+  <div class="qr" data-link="$LE"></div>
+</div>
+HTML
+    done <"$USERS"
+  else
+    printf '<p class="warn">لا يوجد مستخدمون.</p>'
+  fi
+cat <<'HTML'
+<form method="post">
+  <input type="hidden" name="action" value="useradd">
+  <input name="name" placeholder="اسم المستخدم (اختياري)" size="18">
+  <button>إضافة مستخدم</button>
+</form>
+</div>
 HTML
 else
 cat <<'HTML'
 <div class="card"><p class="warn">البوابة غير مثبتة.</p>
 <p>ملفا الخدمة يُنشآن في الخطوة [4/6]. غيابهما يعني أن التثبيت توقف قبلها.</p>
 <p><a class="btn" href="setup.cgi">افتح صفحة الإعداد</a></p>
-<p>أو على الراوتر مباشرة:</p><pre>sh /root/xe3000autouiinput.sh install</pre></div>
+<p>أو على الراوتر: <code>sh /root/xe3000autouiinput.sh install</code></p></div>
 HTML
 fi
+
 cat <<HTML
-<div class="card"><b>بيانات Cloudflare المحفوظة:</b> $CRED
-<form method="get"><input type="hidden" name="action" value="forget">
-<p>للحذف النهائي اكتب FORGET:
-<input name="confirm" size="10"> <button>حذف</button></p></form>
-<p>الحذف لا يلغي التوكن في حساب Cloudflare.</p></div>
+<div class="card"><h2>بيانات Cloudflare المحفوظة</h2><p>$CRED</p>
+<form method="post"><input type="hidden" name="action" value="forget">
+<input name="confirm" size="10" placeholder="FORGET"> <button class="del">حذف نهائي</button></form>
+<p class="uid">الحذف لا يلغي التوكن في حساب Cloudflare.</p></div>
 </div>
+<script>
 HTML
+cat <<'JSLIB'
+@QRLIB@
+function cp(b){
+  var i=b.parentNode.querySelector('input'), t=i.value, done=function(){
+    var o=b.textContent; b.textContent='تم النسخ ✓';
+    setTimeout(function(){b.textContent=o;},1400);
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done,function(){i.select();document.execCommand('copy');done();});
+  } else { i.select(); i.setSelectionRange(0,99999); document.execCommand('copy'); done(); }
+}
+(function(){
+  var els=document.querySelectorAll('.qr');
+  for(var i=0;i<els.length;i++){
+    try{ els[i].innerHTML=QR.svg(els[i].getAttribute('data-link'),4,2); }
+    catch(e){ els[i].textContent='تعذّر توليد رمز QR: '+e.message; }
+  }
+})();
+JSLIB
+printf '</script>'
 UICGI
     cat >"$UIROOT/cgi-bin/setup.cgi" <<'UISETUP'
 #!/bin/sh
@@ -696,6 +1137,12 @@ fi
 printf '<p><a href="control.cgi">لوحة التحكم</a></p></div>'
 UISETUP
     sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/setup.cgi"
+    sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/control.cgi"
+    write_qrlib
+    awk -v f="$UIROOT/qr.js" '/@QRLIB@/{while((getline l < f)>0) print l; next} {print}' \
+        "$UIROOT/cgi-bin/control.cgi" >"$UIROOT/cgi-bin/control.cgi.new" &&
+        mv "$UIROOT/cgi-bin/control.cgi.new" "$UIROOT/cgi-bin/control.cgi"
+    rm -f "$UIROOT/qr.js"
     chmod 755 "$UIROOT/cgi-bin/control.cgi" "$UIROOT/cgi-bin/setup.cgi"
     ok "كُتبت ملفات اللوحة"
 }
@@ -844,6 +1291,7 @@ do_install() {
 
     step 6 "تثبيت لوحة $UI_PORT..."
     install_ui
+    install_launchers
 
     say ""
     ok "اكتمل التثبيت."
@@ -856,9 +1304,18 @@ show_client() {
     say ""
     say "بيانات العميل (VLESS + WebSocket عبر Cloudflare):"
     say "  العنوان : $CF_HOSTNAME   المنفذ: 443   TLS: مُفعّل"
-    say "  UUID    : $XRAY_UUID"
-    say "  المسار  : $XRAY_WSPATH"
-    say "  الشبكة  : ws   |   SNI/Host: $CF_HOSTNAME"
+    say "  المسار  : $XRAY_WSPATH   |   الشبكة: ws"
+    say ""
+    say "روابط الاشتراك الكاملة:"
+    users_init
+    while IFS="$(printf '\t')" read -r _u _n; do
+        [ -n "$_u" ] || continue
+        say ""
+        say "[$_n]"
+        user_link "$_u" "$_n"; say ""
+    done <"$USERS"
+    say ""
+    say "لرمز QR ونسخ الروابط بضغطة: https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi"
 }
 
 do_status() {
@@ -973,6 +1430,9 @@ do_remove() {
     /etc/init.d/firewall reload >/dev/null 2>&1
     /etc/init.d/uhttpd reload >/dev/null 2>&1
     rm -rf "$BASE"
+    for _l in /usr/bin/xe3000 /usr/bin/menu; do
+        grep -q xe3000autouiinput "$_l" 2>/dev/null && rm -f "$_l"
+    done
     ok "أُزيلت البوابة. البيانات المحفوظة في $CREDS لم تُمس (احذفها بـ forget-creds)."
 }
 
@@ -1039,6 +1499,89 @@ do_set_token() {
     return 1
 }
 
+# ----------------------------------------------------------------- قائمة SSH
+menu_pause() { read_tty "اضغط Enter للمتابعة… " _x; }
+
+do_menu() {
+    has_tty || die "الأمر menu تفاعلي — شغّله من جلسة SSH."
+    while : ; do
+        printf '\n'
+        say "══════ XE3000 Full-Tunnel ══════"
+        if load_settings 2>/dev/null; then
+            say "  المضيف: $CF_HOSTNAME    المستخدمون: $(users_count)"
+            say "  xray: $(/etc/init.d/xe3000-cf-xray running >/dev/null 2>&1 && echo يعمل || echo متوقف)   cloudflared: $(/etc/init.d/xe3000-cf-tunnel running >/dev/null 2>&1 && echo يعمل || echo متوقف)"
+        else
+            say "  غير مثبت"
+        fi
+        say "────────────────────────────────"
+        say "  1) الحالة            2) المستخدمون"
+        say "  3) الروابط           4) تشغيل/إيقاف/إعادة"
+        say "  5) تشخيص             6) تبديل التوكن"
+        say "  7) كلمة مرور اللوحة  8) لوحة 9000"
+        say "  9) تثبيت/إكمال       0) خروج"
+        read_tty "الاختيار: " _c
+        case "$_c" in
+            1) do_status ;;
+            2) menu_users ;;
+            3) users_links ;;
+            4) menu_services ;;
+            5) do_diagnose ;;
+            6) do_set_token || true ;;
+            7) need_root; set_password 1 && configure_uhttpd ;;
+            8) say "https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi" ;;
+            9) do_auto_self || true ;;
+            0|q|Q) return 0 ;;
+            *) warn "اختيار غير معروف." ;;
+        esac
+        menu_pause
+    done
+}
+
+menu_users() {
+    while : ; do
+        printf '\n'
+        say "── المستخدمون ──"
+        users_list
+        say "  a) إضافة   d) حذف   r) تطبيق وإعادة تشغيل   b) رجوع"
+        read_tty "الاختيار: " _c
+        case "$_c" in
+            a|A) read_tty "الاسم (فارغ = تلقائي): " _n
+                 user_add "$_n" >/dev/null && users_apply ;;
+            d|D) read_tty "الاسم أو المعرّف للحذف: " _k
+                 [ "$(users_count)" -gt 1 ] || { warn "لا يمكن حذف آخر مستخدم."; continue; }
+                 user_del "$_k" && users_apply ;;
+            r|R) users_apply ;;
+            b|B|'') return 0 ;;
+            *) warn "اختيار غير معروف." ;;
+        esac
+    done
+}
+
+menu_services() {
+    say "  1) تشغيل   2) إيقاف   3) إعادة تشغيل"
+    read_tty "الاختيار: " _c
+    case "$_c" in
+        1) _a=start ;; 2) _a=stop ;; 3) _a=restart ;; *) return 0 ;;
+    esac
+    for _s in xe3000-cf-xray xe3000-cf-tunnel; do
+        [ -x /etc/init.d/$_s ] && /etc/init.d/$_s "$_a" >/dev/null 2>&1 && ok "$_s: $_a" || warn "$_s: تعذر $_a"
+    done
+}
+
+# اختصارات الصدفة: xe3000 و menu
+install_launchers() {
+    [ -f "$SELF_ABS" ] || return 0
+    printf '#!/bin/sh\nexec sh %s "$@"\n' "$SELF_ABS" >/usr/bin/xe3000
+    chmod 755 /usr/bin/xe3000
+    if [ ! -e /usr/bin/menu ] || grep -q xe3000autouiinput /usr/bin/menu 2>/dev/null; then
+        printf '#!/bin/sh\nexec sh %s menu "$@"\n' "$SELF_ABS" >/usr/bin/menu
+        chmod 755 /usr/bin/menu
+        ok "الأمران xe3000 و menu متاحان من أي مسار"
+    else
+        warn "/usr/bin/menu موجود لجهة أخرى — استخدم الأمر xe3000 menu"
+    fi
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -1053,6 +1596,11 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
+  sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
+  sh $SELF user-list        عرض المستخدمين
+  sh $SELF user-add [اسم]   إضافة مستخدم وتطبيقه
+  sh $SELF user-del <اسم>   حذف مستخدم وتطبيقه
+  sh $SELF links            طباعة روابط الاشتراك الكاملة
   sh $SELF preflight        فحوصات Cloudflare الأربعة
   sh $SELF creds-status     هل البيانات محفوظة
   sh $SELF forget-creds     حذفها نهائيًا
@@ -1076,6 +1624,13 @@ case "${1:-}" in
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     set-token)          do_set_token ;;
+    menu)               do_menu ;;
+    user-list)          load_settings >/dev/null 2>&1; users_list ;;
+    user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
+    user-del)           need_root
+                        [ "$(users_count)" -gt 1 ] || die "لا يمكن حذف آخر مستخدم."
+                        user_del "${2:-}" && users_apply ;;
+    links)              users_links ;;
     preflight)          need_root; need_cmd curl; need_cmd jsonfilter
                         collect_creds; preflight_cloudflare ;;
     creds-status)       creds_status ;;
