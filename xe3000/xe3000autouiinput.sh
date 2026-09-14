@@ -1596,6 +1596,14 @@ install_launchers() {
 
 # ----------------------------------------------------------------- فحص السلسلة
 # يتتبع المسار كاملًا: xray ← cloudflared ← حافة Cloudflare ← DNS ← الطلب العام
+# سطر حالة مصافحة WebSocket — الترقية الناجحة تُبقي الاتصال مفتوحًا
+ws_probe() {
+    curl -si --max-time 6 --http1.1 \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
+        "$1" 2>/dev/null | head -n1 | tr -d '\r'
+}
+
 do_selftest() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
@@ -1621,15 +1629,40 @@ do_selftest() {
     fi
 
     say ""
+    say "── 2ب) الإعداد الفعلي لـ xray ──"
+    _cfg=$XRAY_DIR/config.json
+    if [ -s "$_cfg" ]; then
+        _j=$(cat "$_cfg")
+        _cp=$(jf "$_j" '@.inbounds[0].port')
+        _cn=$(jf "$_j" '@.inbounds[0].streamSettings.network')
+        _cw=$(jf "$_j" '@.inbounds[0].streamSettings.wsSettings.path')
+        _cl=$(jf "$_j" '@.inbounds[0].listen')
+        _cpr=$(jf "$_j" '@.inbounds[0].protocol')
+        say "    protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
+        say "    path في config.json : $_cw"
+        say "    path في settings.env: $XRAY_WSPATH"
+        [ "$_cn" = ws ]           || { err "network ليس ws — الترقية لن تنجح أبدًا."; _fail=1; }
+        [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
+        [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
+    else
+        err "$_cfg مفقود أو فارغ."; _fail=1
+    fi
+
+    say ""
     say "── 3) مصافحة WebSocket محليًا ──"
-    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
-         -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-         -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
-         "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH" 2>/dev/null)
-    case "$_c" in
-        101) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
-        000) err "لا استجابة من xray على $XRAY_WSPATH"; _fail=1 ;;
-        *)   warn "xray ردّ $_c على $XRAY_WSPATH (المتوقع 101)" ;;
+    # ترقية ناجحة تُبقي الاتصال مفتوحًا، فلا يصلح %{http_code}: نقرأ سطر الحالة نفسه.
+    _l=$(ws_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
+    case "$_l" in
+        *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
+        '')    err "لا سطر استجابة من xray على $XRAY_WSPATH"
+               say "    (اتصال مقبول ثم مغلق بلا ردّ HTTP = الناقل ليس ws فعليًا)"
+               say ""
+               say "    ── من يستمع على المنفذ ──"
+               netstat -ltnp 2>/dev/null | grep ":$XRAY_PORT " || say "    (netstat بلا -p على هذا النظام)"
+               say "    ── آخر سطور xray ──"
+               logread 2>/dev/null | grep -i xray | tail -15 || say "    (لا سجل)"
+               _fail=1 ;;
+        *)     err "xray ردّ: $_l (المتوقع 101)"; _fail=1 ;;
     esac
 
     say ""
@@ -1664,23 +1697,24 @@ do_selftest() {
 
     say ""
     say "── 6) الطلب العام عبر Cloudflare ──"
-    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$CF_HOSTNAME/" 2>/dev/null)
-    case "$_c" in
+    _e=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$CF_HOSTNAME/" 2>&1)
+    case "$_e" in
         404) ok "الحافة تصل إلى cloudflared (404 من ingress هو المتوقع للجذر)" ;;
         530) err "خطأ 530 — DNS يشير إلى النفق لكن لا اتصال نشط من cloudflared."; _fail=1 ;;
-        000) err "لا استجابة من https://$CF_HOSTNAME/"; _fail=1 ;;
-        *)   say "    الحافة ردّت $_c" ;;
+        000|curl*)
+            warn "الراوتر نفسه لم يصل إلى https://$CF_HOSTNAME/ ($_e)"
+            say  "    كثيرًا ما يعجز الراوتر عن طلب مضيفه العام من الداخل؛"
+            say  "    جرّبه من الهاتف أو حاسوب خارج الشبكة قبل عدّه عطلًا." ;;
+        *)   say "    الحافة ردّت $_e" ;;
     esac
 
     say ""
-    _c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-         -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-         -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
-         "https://$CF_HOSTNAME$XRAY_WSPATH" 2>/dev/null)
-    case "$_c" in
-        101) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل." ;;
-        404) err "الحافة ترد 404 على المسار — تحقق من تطابق path في إعداد العميل."; _fail=1 ;;
-        *)   warn "المسار العام ردّ $_c (المتوقع 101)"; _fail=1 ;;
+    _l=$(ws_probe "https://$CF_HOSTNAME$XRAY_WSPATH")
+    case "$_l" in
+        *101*) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل." ;;
+        *404*) err "الحافة ترد 404 على المسار — path في العميل لا يطابق الإعداد."; _fail=1 ;;
+        '')    err "لا سطر استجابة على المسار العام."; _fail=1 ;;
+        *)     err "المسار العام ردّ: $_l (المتوقع 101)"; _fail=1 ;;
     esac
 
     say ""
