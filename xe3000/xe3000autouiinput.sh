@@ -1597,12 +1597,27 @@ install_launchers() {
 # ----------------------------------------------------------------- فحص السلسلة
 # يتتبع المسار كاملًا: xray ← cloudflared ← حافة Cloudflare ← DNS ← الطلب العام
 # سطر حالة مصافحة WebSocket — الترقية الناجحة تُبقي الاتصال مفتوحًا
-ws_probe() {
-    curl -si --max-time 6 --http1.1 \
-        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-        -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==' \
-        "$1" 2>/dev/null | head -n1 | tr -d '\r'
+# سطر الحالة من curl. لا يُمزج stderr في الأنبوب: المزج يجعل الترتيب غير محدد
+# فيبتلع سطر 101 أحيانًا. نفصل التيارين ونقع على خطأ curl فقط عند غياب الرد.
+_probe() { # $1 = رابط، بقية الوسائط ترويسات
+    _u=$1; shift
+    _pe=/tmp/.xe3000probe.$$
+    _po=$(curl -sSi --noproxy '*' --max-time 6 --http1.1 "$@" "$_u" 2>"$_pe")
+    _pl=$(printf '%s' "$_po" | head -n1 | tr -d '\r')
+    [ -n "$_pl" ] || _pl=$(head -n1 "$_pe" 2>/dev/null | tr -d '\r')
+    rm -f "$_pe"
+    printf '%s' "$_pl"
 }
+
+ws_probe() {
+    _probe "$1" \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA=='
+}
+
+# GET عادي: خادم ws في Xray يردّ 400، ومسار خاطئ 404 — دليل حياة بلا تعليق
+# الاتصال الذي تسببه ترقية ناجحة.
+http_probe() { _probe "$1"; }
 
 do_selftest() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
@@ -1649,13 +1664,26 @@ do_selftest() {
     fi
 
     say ""
-    say "── 3) مصافحة WebSocket محليًا ──"
+    say "── 3أ) هل يتكلم xray بروتوكول HTTP على المنفذ؟ ──"
+    _h=$(http_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
+    case "$_h" in
+        *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
+        *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
+        curl:*) err "curl لم يصل إلى 127.0.0.1:$XRAY_PORT — $_h"
+                say "    تحقق من الوكيل: env | grep -i proxy"; _fail=1 ;;
+        '')     err "لا مخرجات من curl على المنفذ المحلي."; _fail=1 ;;
+        *)      say "    ردّ: $_h" ;;
+    esac
+
+    say ""
+    say "── 3ب) مصافحة WebSocket محليًا ──"
     # ترقية ناجحة تُبقي الاتصال مفتوحًا، فلا يصلح %{http_code}: نقرأ سطر الحالة نفسه.
     _l=$(ws_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
     case "$_l" in
         *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
+        curl:*) err "curl لم يصل إلى xray — $_l"; _fail=1 ;;
         '')    err "لا سطر استجابة من xray على $XRAY_WSPATH"
-               say "    (اتصال مقبول ثم مغلق بلا ردّ HTTP = الناقل ليس ws فعليًا)"
+               say "    (اتصال مقبول ثم مغلق بلا ردّ HTTP)"
                say ""
                say "    ── من يستمع على المنفذ ──"
                netstat -ltnp 2>/dev/null | grep ":$XRAY_PORT " || say "    (netstat بلا -p على هذا النظام)"
@@ -1713,6 +1741,8 @@ do_selftest() {
     case "$_l" in
         *101*) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل." ;;
         *404*) err "الحافة ترد 404 على المسار — path في العميل لا يطابق الإعداد."; _fail=1 ;;
+        curl:*) err "curl لم يصل إلى المسار العام — $_l"
+                say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)" ;;
         '')    err "لا سطر استجابة على المسار العام."; _fail=1 ;;
         *)     err "المسار العام ردّ: $_l (المتوقع 101)"; _fail=1 ;;
     esac
