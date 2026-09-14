@@ -26,6 +26,7 @@ esac
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
 XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
+XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -398,8 +399,14 @@ user_link() { # $1 uuid  $2 الاسم
         xhttp) _extra='&mode=auto' ;;
         *)     _extra= ;;
     esac
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
-        "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2"
+    case "${XRAY_PROTO:-vless}" in
+        trojan)
+            printf 'trojan://%s@%s:443?security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
+                "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2" ;;
+        *)
+            printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
+                "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2" ;;
+    esac
 }
 
 users_links() {
@@ -412,6 +419,7 @@ users_links() {
         say "[$_n]"
         user_link "$_u" "$_n"; say ""
     done <"$USERS"
+    show_ssh
 }
 
 # يعيد بناء عملاء xray من ملف المستخدمين ثم يعيد تشغيل الخدمة
@@ -448,6 +456,13 @@ write_cfd_config() {
     else
         _oreq=
     fi
+    _sshrule=
+    if [ "${SSHWS:-0}" = 1 ] && ! is_sock; then
+        _sshrule="  - hostname: $CF_HOSTNAME
+    path: ^$SSH_PATH
+    service: http://$XRAY_LISTEN:$SSH_PORT
+"
+    fi
     cat >"$CFD_DIR/config.yml" <<CFDCFG
 tunnel: $TUNNEL_ID
 credentials-file: $BASE/tunnel/$TUNNEL_ID.json
@@ -455,7 +470,7 @@ protocol: http2
 no-autoupdate: true
 loglevel: info
 ingress:
-  - hostname: $CF_HOSTNAME
+$_sshrule  - hostname: $CF_HOSTNAME
     service: $(cfd_service)$_oreq
   - service: http_status:404
 CFDCFG
@@ -466,32 +481,53 @@ write_xray_config() {
     mkdir -p "$XRAY_DIR" || die "تعذر إنشاء $XRAY_DIR"
     users_init
     [ -s "$USERS" ] || die "لا يوجد مستخدمون."
-    _clients=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
     if is_sock; then
         _addr="\"listen\": \"$XRAY_LISTEN\","
         _sock=', "sockopt": { "domainSockets": {} }'
         rm -f "$XRAY_LISTEN"
     else
         _addr="\"listen\": \"$XRAY_LISTEN\", \"port\": $XRAY_PORT,"
-        # TCP Fast Open معطّل صراحةً: نواة هذا الجهاز تُنشئ طلبات اتصال
-        # بعناوين مصفّرة معه، فلا تكتمل المصافحة أبدًا.
+        # TFO معطّل: نواة هذا الجهاز تُنشئ معه طلبات اتصال بعناوين مصفّرة
         _sock=', "sockopt": { "tcpFastOpen": false }'
     fi
-    # xhttp لا يستعمل ترقية HTTP، فيمرّ عبر cloudflared إلى أصل unix بخلاف ws
     case "${XRAY_NET:-ws}" in
         xhttp) _stream="\"network\": \"xhttp\", \"xhttpSettings\": { \"path\": \"$XRAY_WSPATH\", \"mode\": \"auto\" }" ;;
         *)     _stream="\"network\": \"ws\", \"wsSettings\": { \"path\": \"$XRAY_WSPATH\" }" ;;
     esac
+    # trojan يستعمل كلمة مرور وvless معرّفًا — نفس القائمة تخدم الاثنين
+    case "${XRAY_PROTO:-vless}" in
+        trojan)
+            _proto=trojan
+            _cl=$(awk -F'\t' 'NF{ printf "%s{ \"password\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
+            _settings="{ \"clients\": [ $_cl ] }" ;;
+        *)
+            _proto=vless
+            _cl=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
+            _settings="{ \"clients\": [ $_cl ], \"decryption\": \"none\" }" ;;
+    esac
+
+    # جسر SSH عبر WebSocket: منفذ ثانٍ يمرّر البايتات الخام إلى خادم SSH المحلي
+    _ssh=
+    if [ "${SSHWS:-0}" = 1 ] && ! is_sock; then
+        _ssh=",
+    {
+      \"listen\": \"$XRAY_LISTEN\", \"port\": $SSH_PORT,
+      \"protocol\": \"dokodemo-door\",
+      \"settings\": { \"address\": \"127.0.0.1\", \"port\": 22, \"network\": \"tcp\" },
+      \"streamSettings\": { \"network\": \"ws\", \"wsSettings\": { \"path\": \"$SSH_PATH\" }, \"sockopt\": { \"tcpFastOpen\": false } }
+    }"
+    fi
+
     cat >"$XRAY_DIR/config.json.new" <<XRAYCFG
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
       $_addr
-      "protocol": "vless",
-      "settings": { "clients": [ $_clients ], "decryption": "none" },
+      "protocol": "$_proto",
+      "settings": $_settings,
       "streamSettings": { $_stream$_sock }
-    }
+    }$_ssh
   ],
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
@@ -554,6 +590,10 @@ write_configs() {
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
+    XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
+    SSHWS=${FULLTUNNEL_SSHWS:-0}
+    SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}
+    SSH_PORT=$(( XRAY_PORT + 1 ))
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
     users_init
     if [ ! -s "$USERS" ]; then
@@ -619,6 +659,10 @@ FULLTUNNEL_TUNNEL_NAME=$TUNNEL_NAME
 FULLTUNNEL_XRAY_PORT=$XRAY_PORT
 FULLTUNNEL_XRAY_LISTEN=$XRAY_LISTEN
 FULLTUNNEL_XRAY_NET=${XRAY_NET:-ws}
+FULLTUNNEL_PROTO=${XRAY_PROTO:-vless}
+FULLTUNNEL_SSHWS=${SSHWS:-0}
+FULLTUNNEL_SSH_PATH=${SSH_PATH:-/ssh}
+FULLTUNNEL_SSH_PORT=${SSH_PORT:-0}
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -636,6 +680,11 @@ load_settings() {
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-}
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
+    XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
+    SSHWS=${FULLTUNNEL_SSHWS:-0}
+    SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh}
+    SSH_PORT=${FULLTUNNEL_SSH_PORT:-0}
+    [ "$SSH_PORT" = 0 ] && SSH_PORT=$(( ${XRAY_PORT:-18443} + 1 ))
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
@@ -1399,6 +1448,7 @@ show_client() {
         user_link "$_u" "$_n"; say ""
     done <"$USERS"
     say ""
+    show_ssh
     say "لرمز QR ونسخ الروابط بضغطة: https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi"
 }
 
@@ -2031,6 +2081,140 @@ do_set_transport() {
     say "أو من اللوحة برمز QR."
 }
 
+do_set_protocol() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    case "${1:-}" in
+        vless|trojan) XRAY_PROTO=$1 ;;
+        *) die "البروتوكول: vless أو trojan" ;;
+    esac
+    save_settings; users_apply
+    ok "البروتوكول الآن: $XRAY_PROTO"
+    warn "روابط العملاء تغيّرت — أعد استيرادها: sh $SELF links"
+}
+
+do_sshws() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    case "${1:-}" in
+        on|1)
+            is_sock && die "جسر SSH يحتاج استماعًا على TCP: sh $SELF set-listen 127.0.0.1"
+            command -v dropbear >/dev/null 2>&1 || command -v sshd >/dev/null 2>&1 ||
+                warn "لم أجد خادم SSH على الجهاز — الجسر سيُنشأ لكنه لن يجد ما يتصل به."
+            SSHWS=1
+            case "$SSH_PATH" in /ssh|'') SSH_PATH=/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8) ;; esac
+            SSH_PORT=$(( XRAY_PORT + 1 )) ;;
+        off|0) SSHWS=0 ;;
+        *) die "الاستعمال: ssh-ws on|off" ;;
+    esac
+    save_settings; users_apply; write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    if [ "$SSHWS" = 1 ]; then
+        ok "جسر SSH عبر WebSocket مفعّل"
+        show_ssh
+    else
+        ok "جسر SSH معطّل"
+    fi
+}
+
+show_ssh() {
+    [ "${SSHWS:-0}" = 1 ] || return 0
+    say ""
+    say "SSH عبر WebSocket (wss):"
+    say "  العنوان : $CF_HOSTNAME   المنفذ: 443   TLS: مُفعّل"
+    say "  المسار  : $SSH_PATH"
+    say "  الوجهة  : خادم SSH المحلي 127.0.0.1:22"
+    say "  في تطبيقات SSH/WS: اجعل payload يطلب المسار أعلاه على المضيف نفسه."
+}
+
+# مراقبة دورية: إن سقط المسار العام تُعاد الخدمتان — ولا تُعاد إن كان العطل في الإنترنت
+write_watchdog() {
+    cat >"$BASE/watchdog.sh" <<WDOG
+#!/bin/sh
+. $SETTINGS 2>/dev/null || exit 0
+H=\$FULLTUNNEL_HOSTNAME
+[ -n "\$H" ] || exit 0
+# لا إنترنت؟ إعادة التشغيل لا تُصلح شيئًا
+ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 || exit 0
+_c=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://\$H/" 2>/dev/null)
+case "\$_c" in
+    2*|4*) exit 0 ;;
+esac
+logger -t xe3000 "watchdog: المسار العام ردّ '\$_c' — إعادة تشغيل الخدمتين"
+/etc/init.d/xe3000-cf-xray restart >/dev/null 2>&1
+/etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
+WDOG
+    chmod 750 "$BASE/watchdog.sh"
+}
+
+do_watchdog() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    _cron=/etc/crontabs/root
+    case "${1:-}" in
+        on|1)
+            _m=${2:-5}
+            case "$_m" in ''|*[!0-9]*) die "الفاصل بالدقائق رقم." ;; esac
+            write_watchdog
+            mkdir -p /etc/crontabs
+            touch "$_cron"
+            sed -i '\#xe3000-cf-fulltunnel/watchdog.sh#d' "$_cron"
+            printf '*/%s * * * * %s/watchdog.sh\n' "$_m" "$BASE" >>"$_cron"
+            /etc/init.d/cron enable >/dev/null 2>&1
+            /etc/init.d/cron restart >/dev/null 2>&1
+            ok "المراقبة مفعّلة كل $_m دقائق" ;;
+        off|0)
+            [ -f "$_cron" ] && sed -i '\#xe3000-cf-fulltunnel/watchdog.sh#d' "$_cron"
+            /etc/init.d/cron restart >/dev/null 2>&1
+            rm -f "$BASE/watchdog.sh"
+            ok "المراقبة معطّلة" ;;
+        test)
+            write_watchdog; sh "$BASE/watchdog.sh"; ok "شُغّلت مرة واحدة — راجع: logread -e xe3000" ;;
+        *) die "الاستعمال: watchdog on [دقائق] | off | test" ;;
+    esac
+}
+
+# كِل‑سويتش WireGuard يوجّه كل مرور الراوتر إلى النفق ويحجب ما عداه، فيسقط
+# اتصال cloudflared بحافة Cloudflare. نعلّم مروره ليخرج مباشرة عبر WAN.
+write_fwinclude() {
+    cat >"$BASE/firewall.sh" <<'FWI'
+#!/bin/sh
+# اتصال cloudflared بالحافة على 7844 يخرج مباشرة، فلا يقطعه كِل‑سويتش VPN
+for _p in tcp udp; do
+    iptables -w -t mangle -C OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
+        -j MARK --set-xmark 0x8000/0xf000 2>/dev/null ||
+    iptables -w -t mangle -I OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
+        -j MARK --set-xmark 0x8000/0xf000
+done
+FWI
+    chmod 750 "$BASE/firewall.sh"
+}
+
+do_vpn_bypass() {
+    need_root
+    case "${1:-on}" in
+        on|1)
+            write_fwinclude
+            uci -q delete firewall.xe3000_inc
+            uci set firewall.xe3000_inc=include
+            uci set firewall.xe3000_inc.path="$BASE/firewall.sh"
+            uci set firewall.xe3000_inc.reload=1
+            uci commit firewall
+            sh "$BASE/firewall.sh"
+            ok "مرور cloudflared يتجاوز كِل‑سويتش VPN (منفذ 7844 مباشر)"
+            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز." ;;
+        off|0)
+            uci -q delete firewall.xe3000_inc && uci commit firewall
+            for _p in tcp udp; do
+                iptables -w -t mangle -D OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
+                    -j MARK --set-xmark 0x8000/0xf000 2>/dev/null
+            done
+            rm -f "$BASE/firewall.sh"
+            ok "أُلغي التجاوز" ;;
+        *) die "الاستعمال: vpn-bypass on|off" ;;
+    esac
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -2048,6 +2232,10 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
   sh $SELF set-transport <ws|xhttp>  تبديل الناقل
   sh $SELF set-port <رقم>   تبديل المنفذ المحلي
+  sh $SELF set-protocol <vless|trojan>  تبديل البروتوكول
+  sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
+  sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
+  sh $SELF vpn-bypass on|off  تجاوز كِل‑سويتش WireGuard
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -2082,6 +2270,10 @@ case "${1:-}" in
     set-listen)         do_set_listen "${2:-}" ;;
     set-transport)      do_set_transport "${2:-}" ;;
     set-port)           do_set_port "${2:-}" ;;
+    set-protocol)       do_set_protocol "${2:-}" ;;
+    ssh-ws)             do_sshws "${2:-}" ;;
+    watchdog)           do_watchdog "${2:-}" "${3:-}" ;;
+    vpn-bypass)         do_vpn_bypass "${2:-on}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
