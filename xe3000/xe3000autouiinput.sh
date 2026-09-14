@@ -1664,13 +1664,47 @@ do_selftest() {
     fi
 
     say ""
+    say "── 2ج) وصول TCP إلى المنفذ المحلي ──"
+    # فشل بمهلة على منفذ مستمع = إسقاط حزم، لا رفض اتصال
+    if command -v nc >/dev/null 2>&1; then
+        if nc -w 3 -z 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
+            ok "nc وصل إلى 127.0.0.1:$XRAY_PORT — الطبقة الرابعة سليمة"
+        else
+            err "nc لم يصل إلى 127.0.0.1:$XRAY_PORT"
+            say "    إن كانت الحلقة 2 أظهرت المنفذ مستمعًا فهذا إسقاط حزم على"
+            say "    loopback — جدار ناري أو اعتراض TPROXY/REDIRECT، لا عطل في xray."
+            _lo=1; _fail=1
+        fi
+    else
+        say "    nc غير مثبت — تُخطّى."
+    fi
+    if [ "${_lo:-0}" = 1 ] || [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
+        say "    ── قواعد تخص المنفذ $XRAY_PORT ──"
+        { nft list ruleset 2>/dev/null | grep -iE "$XRAY_PORT|tproxy|redirect"
+          iptables-save 2>/dev/null | grep -iE "$XRAY_PORT|TPROXY|REDIRECT"
+        } | head -20 || say "    (لا قواعد مطابقة)"
+        say "    ── قبول loopback ──"
+        { nft list ruleset 2>/dev/null | grep -A2 'iif "lo"'
+          iptables -S INPUT 2>/dev/null | grep -i ' lo '
+        } | head -10 || say "    (لا قاعدة صريحة لقبول lo)"
+        say "    ── وكيل في البيئة (الأسماء فقط، لا القيم) ──"
+        env | grep -i proxy | cut -d= -f1 || say "    (لا متغيّرات وكيل)"
+    fi
+
+    say ""
     say "── 3أ) هل يتكلم xray بروتوكول HTTP على المنفذ؟ ──"
     _h=$(http_probe "http://127.0.0.1:$XRAY_PORT$XRAY_WSPATH")
     case "$_h" in
         *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
         *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
         curl:*) err "curl لم يصل إلى 127.0.0.1:$XRAY_PORT — $_h"
-                say "    تحقق من الوكيل: env | grep -i proxy"; _fail=1 ;;
+                case "$_h" in
+                  *"Connection timed out"*)
+                      say "    مهلة في مصافحة TCP على منفذ مستمع = حزم تُسقَط." ;;
+                  *"Connection refused"*)
+                      say "    رفض اتصال = لا شيء يستمع فعلًا على هذا المنفذ." ;;
+                esac
+                _fail=1 ;;
         '')     err "لا مخرجات من curl على المنفذ المحلي."; _fail=1 ;;
         *)      say "    ردّ: $_h" ;;
     esac
