@@ -1950,6 +1950,26 @@ do_set_listen() {
     say "تحقق: sh $SELF selftest"
 }
 
+# تبديل منفذ xray المحلي — منفذ بعينه قد يكون محجوزًا أو معترَضًا
+do_set_port() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    _p=${1:-}
+    case "$_p" in
+        ''|*[!0-9]*) die "المنفذ يجب أن يكون رقمًا." ;;
+    esac
+    [ "$_p" -ge 1024 ] && [ "$_p" -le 65535 ] || die "اختر منفذًا بين 1024 و65535."
+    XRAY_PORT=$_p
+    is_sock && { warn "الاستماع على مقبس Unix — المنفذ غير مستعمل."; \
+                 say "بدّل أولًا: sh $SELF set-listen 127.0.0.1"; }
+    save_settings
+    users_apply
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "المنفذ المحلي الآن $XRAY_PORT"
+    say "تحقق: sh $SELF selftest"
+}
+
 # ws يحتاج ترقية HTTP وcloudflared لا يمرّرها إلى أصل unix؛ xhttp لا يحتاجها
 do_set_transport() {
     need_root
@@ -1981,6 +2001,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
   sh $SELF set-transport <ws|xhttp>  تبديل الناقل
+  sh $SELF set-port <رقم>   تبديل المنفذ المحلي
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -2013,6 +2034,7 @@ case "${1:-}" in
     selftest)           do_selftest ;;
     set-listen)         do_set_listen "${2:-}" ;;
     set-transport)      do_set_transport "${2:-}" ;;
+    set-port)           do_set_port "${2:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
