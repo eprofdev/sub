@@ -1682,6 +1682,15 @@ do_selftest() {
         say "    nc غير مثبت — تُخطّى."
     fi
     if [ "${_lo:-0}" = 1 ] || [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
+        # EPERM على حزمة محلية = إسقاط في LOCAL_OUT، فالدليل في سلسلة OUTPUT
+        say "    ── OUTPUT (filter) مع العدّادات بعد محاولة اتصال ──"
+        iptables -Z OUTPUT >/dev/null 2>&1
+        ( nc -w 2 -z "$XRAY_LISTEN" "$XRAY_PORT" >/dev/null 2>&1 || true )
+        iptables -L OUTPUT -n -v --line-numbers 2>/dev/null | head -25 || say "    (iptables غير متاح)"
+        say "    ── OUTPUT (mangle) ──"
+        iptables -t mangle -L OUTPUT -n -v --line-numbers 2>/dev/null | head -20
+        say "    ── سلاسل السياسة ──"
+        iptables -S 2>/dev/null | grep -E '^-A (OUTPUT|policy_|.*_output)' | head -25
         say "    ── قواعد تخص المنفذ $XRAY_PORT ──"
         { nft list ruleset 2>/dev/null | grep -iE "$XRAY_PORT|tproxy|redirect"
           iptables-save 2>/dev/null | grep -iE "$XRAY_PORT|TPROXY|REDIRECT"
