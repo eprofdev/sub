@@ -61,26 +61,43 @@ if [ "$REACHED" = 0 ]; then
 fi
 
 # وصلت الطلبات وردّ Cloudflare — إذًا السبب في القيم أو الصلاحيات لا في الشبكة.
+# الفحص 2 يحتاج Account Settings · Read وهي ليست من صلاحيات التوكن الموصى به،
+# فسقوطه وحده لا يدل على شيء. الحاسم للحساب هو الفحص 4.
 case "$RESULT" in
     *1:fail*)
         echo "الفحص 1 فشل → التوكن خاطئ أو منتهٍ أو فيه محرف زائد."
-        echo "أعد إنشاءه، ثم: sh /root/xe3000autouiinput.sh forget-creds" ;;
-    *2:fail*3:fail*)
-        echo "2 و 3 فشلا والتوكن صالح → المعرّفان من حساب آخر."
-        echo "انسخ Account ID و Zone ID من لوحة Cloudflare لنفس الحساب." ;;
-    *2:fail*)
-        echo "الفحص 2 فقط → Account ID خاطئ." ;;
+        echo "أنشئ توكنًا جديدًا، ثم: sh /root/xe3000autouiinput.sh set-token"
+        exit 1 ;;
+esac
+
+case "$RESULT" in
     *3:fail*)
-        echo "الفحص 3 فقط → Zone ID خاطئ أو ليس في نفس الحساب." ;;
+        echo "الفحص 3 فشل → Zone ID خاطئ أو ليس في نفس الحساب."
+        ZONEBAD=1 ;;
+    *) ZONEBAD=0 ;;
+esac
+
+case "$RESULT" in
     *4:fail*)
-        echo "الفحص 4 فقط → التوكن ينقصه: Account · Cloudflare Tunnel · Edit"
-        echo "أنشئ توكنًا من My Profile ← API Tokens ← Create Token بصلاحيتين فقط:"
+        case "$RESULT" in
+            *2:ok*)
+                echo "الفحص 4 فشل والحساب مقروء → التوكن ينقصه: Account · Cloudflare Tunnel · Edit" ;;
+            *)
+                echo "الفحصان 2 و 4 فشلا → Account ID خاطئ، أو التوكن ليس لهذا الحساب."
+                echo "انسخ Account ID من الشريط الجانبي في لوحة Cloudflare." ;;
+        esac
+        echo "التوكن الصحيح بصلاحيتين فقط:"
         echo "  Account · Cloudflare Tunnel · Edit"
         echo "  Zone    · DNS             · Edit"
-        echo "ثم: sh /root/xe3000autouiinput.sh forget-creds && sh /root/xe3000autouiinput.sh install" ;;
-    *)
-        echo "الفحوصات الأربعة نجحت → المعرّفات والصلاحيات سليمة."
-        echo "أكمل التثبيت: sh /root/xe3000autouiinput.sh"
-        exit 0 ;;
+        exit 1 ;;
 esac
-exit 1
+
+[ "$ZONEBAD" = 1 ] && exit 1
+
+echo "التوكن والحساب والنطاق وصلاحية الأنفاق كلها سليمة."
+case "$RESULT" in
+    *2:fail*)
+        echo "(الفحص 2 سقط لأن التوكن بلا Account Settings · Read — غير مطلوبة.)" ;;
+esac
+echo "أكمل التثبيت: sh /root/xe3000autouiinput.sh"
+exit 0

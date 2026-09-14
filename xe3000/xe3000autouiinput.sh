@@ -217,6 +217,7 @@ cf_errors() {
 # الفحوصات الأربعة — تُشغَّل قبل إنشاء النفق حتى لا يفشل [3/6] بصمت
 preflight_cloudflare() {
     _fail=0
+    _acct_read=0
 
     _r=$(cf GET /user/tokens/verify)
     case "$_r" in
@@ -234,13 +235,15 @@ preflight_cloudflare() {
         return 1
     fi
 
+    # قراءة تفاصيل الحساب تحتاج Account Settings · Read، وهي ليست من صلاحيات
+    # التوكن الموصى به. سقوطها وحده لا يعني شيئًا — الفحص 4 هو الحاسم.
     _r=$(cf GET "/accounts/$CF_ACCOUNT")
     if cf_success "$_r"; then
+        _acct_read=1
         ok "2/4 الحساب: $(jf "$_r" '@.result.name')"
     else
-        err "2/4 الحساب مرفوض: $(cf_errors "$_r")"
-        err "    Account ID خاطئ."
-        _fail=1
+        _acct_read=0
+        say "[--] 2/4 تفاصيل الحساب غير مقروءة — يحسمها الفحص 4."
     fi
 
     _r=$(cf GET "/zones/$CF_ZONE")
@@ -259,11 +262,18 @@ preflight_cloudflare() {
 
     _r=$(cf GET "/accounts/$CF_ACCOUNT/cfd_tunnel?per_page=1")
     if cf_success "$_r"; then
-        ok "4/4 صلاحية الأنفاق متاحة"
+        ok "4/4 صلاحية الأنفاق متاحة — ومعها ثبت أن Account ID صحيح."
+        [ "$_acct_read" = 0 ] && \
+            say "     (سقوط الفحص 2 سببه أن التوكن بلا Account Settings · Read، وهي غير مطلوبة.)"
     else
         err "4/4 صلاحية الأنفاق مرفوضة: $(cf_errors "$_r")"
-        err "    التوكن ينقصه: Account · Cloudflare Tunnel · Edit"
-        err "    أنشئ توكنًا من My Profile ← API Tokens ← Create Token بصلاحيتين فقط:"
+        if [ "$_acct_read" = 1 ]; then
+            err "    الحساب مقروء لكن الأنفاق لا — التوكن ينقصه: Account · Cloudflare Tunnel · Edit"
+        else
+            err "    لا الحساب ولا الأنفاق — Account ID خاطئ، أو التوكن ليس لهذا الحساب."
+            err "    انسخ Account ID من الشريط الجانبي في لوحة Cloudflare."
+        fi
+        err "    التوكن الصحيح من My Profile ← API Tokens ← Create Token بصلاحيتين:"
         err "      Account · Cloudflare Tunnel · Edit"
         err "      Zone    · DNS             · Edit"
         _fail=1
