@@ -578,6 +578,9 @@ start_service() {
     [ -f /etc/xe3000-cf-fulltunnel/xray/config.json ] || return 1
     procd_open_instance
     procd_set_param command /usr/bin/xray run -c /etc/xe3000-cf-fulltunnel/xray/config.json
+    # Go 1.24+ يفتح المستمعين بـ MPTCP افتراضيًا، وبعض النوى (ومنها هذا الجهاز)
+    # تُنشئ معه طلبات اتصال بعناوين صفرية فلا تكتمل المصافحة.
+    procd_set_param env GODEBUG=multipathtcp=0
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -639,6 +642,16 @@ load_settings() {
 }
 
 # ----------------------------------------------------------------- [5/6] التشغيل
+# MPTCP: إن كان مفعّلًا فمستمعو Go يُفتحون به. لا نعطّله على مستوى النظام
+# (قد يعتمد عليه دمج الوصلات في الراوتر) بل نعطّله لعملية xray وحدها.
+mptcp_note() {
+    _m=/proc/sys/net/mptcp/enabled
+    [ -r "$_m" ] || return 0
+    [ "$(cat "$_m" 2>/dev/null)" = 1 ] &&
+        say "    MPTCP مفعّل في النظام — xray يعمل بـ GODEBUG=multipathtcp=0"
+    return 0
+}
+
 # نواة هذا الجهاز تُنتج طلبات اتصال بعناوين صفرية حين يكون TFO فعّالًا
 disable_tfo() {
     _f=/proc/sys/net/ipv4/tcp_fastopen
@@ -1782,6 +1795,9 @@ do_selftest() {
             err "انتهت مهلة الاتصال بـ $XRAY_LISTEN:$XRAY_PORT رغم أن المنفذ مستمع."
             check_offload
             say "    SYN يخرج ولا تكتمل المصافحة — المقبس يستمع لكن الردّ لا يصل سليمًا."
+            mptcp_note
+            grep -q 'multipathtcp' /etc/init.d/xe3000-cf-xray 2>/dev/null ||
+                say "    ملف الخدمة قديم بلا GODEBUG — شغّل: sh $SELF reinstall-services"
             # ضابط: خادم الويب المحلي يفصل بين عطل عام في loopback وعطل في xray
             _ctl=$(curl -sS --noproxy '*' --connect-timeout 4 -o /dev/null \
                    -w '%{http_code}' "http://127.0.0.1:80/" 2>&1)
@@ -2044,6 +2060,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF reset            حذف بقايا تثبيت ناقص
   sh $SELF remove           إزالة كاملة
   sh $SELF prepare-runtime  الاعتمادات فقط
+  sh $SELF reinstall-services إعادة كتابة ملفي الخدمة وتشغيلهما
   sh $SELF version          الإصدار
   sh $SELF help             هذه الشاشة
 USAGE
@@ -2079,6 +2096,8 @@ case "${1:-}" in
     reset)              do_reset ;;
     remove)             do_remove ;;
     prepare-runtime)    need_root; prepare_runtime ;;
+    reinstall-services) need_root; load_settings || die "لا يوجد تثبيت محلي."
+                        write_init; enable_services ;;
     version)            say "$VERSION" ;;
     help|-h|--help)     usage ;;
     *)                  err "أمر غير معروف: $1"; usage; exit 1 ;;
