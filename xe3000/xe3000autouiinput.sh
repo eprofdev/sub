@@ -15,7 +15,8 @@ CFD_DIR=$BASE/cloudflared
 XRAY_DIR=$BASE/xray
 LOGFILE=/var/log/xe3000-fulltunnel.log
 API=https://api.cloudflare.com/client/v4
-UI_PORT=9000
+UI_PORT=9000            # مدخل HTTP، يحوّل إلى HTTPS
+UI_PORT_S=9443          # منفذ HTTPS الفعلي
 SELF=$0
 case "$0" in
     /*) SELF_ABS=$0 ;;
@@ -1239,10 +1240,14 @@ configure_uhttpd() {
         die "شهادة /etc/uhttpd.crt و /etc/uhttpd.key مفقودة. فعّل HTTPS من واجهة GL.iNet."
 
     drop_legacy_uhttpd
+    UI_PORT_S=${FULLTUNNEL_UI_PORT_HTTPS:-$UI_PORT_S}
     uci -q delete uhttpd.xe3000
     uci set uhttpd.xe3000=uhttpd
     uci set uhttpd.xe3000.home="$UIROOT"
-    uci add_list uhttpd.xe3000.listen_https="$_ip:$UI_PORT"
+    # uhttpd لا يجمع HTTP وHTTPS على منفذ واحد: 9000 مدخل HTTP يحوّل إلى HTTPS
+    uci add_list uhttpd.xe3000.listen_http="$_ip:$UI_PORT"
+    uci add_list uhttpd.xe3000.listen_https="$_ip:$UI_PORT_S"
+    uci set uhttpd.xe3000.redirect_https=1
     uci set uhttpd.xe3000.cert=/etc/uhttpd.crt
     uci set uhttpd.xe3000.key=/etc/uhttpd.key
     uci set uhttpd.xe3000.cgi_prefix=/cgi-bin
@@ -1252,21 +1257,26 @@ configure_uhttpd() {
     uci commit uhttpd
 
     # فتح المنفذ على شبكة LAN فقط — بعض صور GL.iNet ترفض المدخلات غير المصرّح بها
-    uci -q delete firewall.xe3000_panel
-    uci set firewall.xe3000_panel=rule
-    uci set firewall.xe3000_panel.name='xe3000-panel'
-    uci set firewall.xe3000_panel.src='lan'
-    uci set firewall.xe3000_panel.proto='tcp'
-    uci set firewall.xe3000_panel.dest_port="$UI_PORT"
-    uci set firewall.xe3000_panel.target='ACCEPT'
+    # قاعدة لكل منفذ: fw3 لا يضمن قائمة منافذ في dest_port
+    for _p in "xe3000_panel:$UI_PORT" "xe3000_panel_s:$UI_PORT_S"; do
+        _sec=${_p%%:*}; _pt=${_p##*:}
+        uci -q delete "firewall.$_sec"
+        uci set "firewall.$_sec=rule"
+        uci set "firewall.$_sec.name=xe3000-panel-$_pt"
+        uci set "firewall.$_sec.src=lan"
+        uci set "firewall.$_sec.proto=tcp"
+        uci set "firewall.$_sec.dest_port=$_pt"
+        uci set "firewall.$_sec.target=ACCEPT"
+    done
     uci commit firewall
     /etc/init.d/firewall reload >/dev/null 2>&1 || warn "تعذر إعادة تحميل الجدار الناري"
 
     # قسم جديد لا يلتقطه reload دائمًا — أعد التشغيل
     /etc/init.d/uhttpd restart >/dev/null 2>&1 || die "تعذر إعادة تشغيل uhttpd"
     sleep 1
-    if netstat -ltn 2>/dev/null | grep -q "$_ip:$UI_PORT "; then
-        ok "اللوحة تستمع على https://$_ip:$UI_PORT/"
+    if netstat -ltn 2>/dev/null | grep -q "$_ip:$UI_PORT_S "; then
+        ok "اللوحة على https://$_ip:$UI_PORT_S/cgi-bin/control.cgi"
+        ok "و http://$_ip:$UI_PORT/ يحوّل إليها تلقائيًا"
     else
         warn "uhttpd أُعيد تشغيله لكن المنفذ $UI_PORT لا يستمع — شغّل: sh $SELF diagnose"
     fi
@@ -1357,7 +1367,7 @@ do_status() {
             say "$s : غير مثبت"
         fi
     done
-    say "اللوحة     : https://$(lan_ip):$UI_PORT/"
+    say "اللوحة     : https://$(lan_ip):$UI_PORT_S/  (مدخل http://$(lan_ip):$UI_PORT/)"
     creds_status
 }
 
@@ -1370,7 +1380,7 @@ do_diagnose() {
         say "  $_s  home=$(uci -q get "uhttpd.$_s.home")  https=$(uci -q get "uhttpd.$_s.listen_https")"
     done
     say "--- المنفذ $UI_PORT ---"
-    netstat -ltn 2>/dev/null | grep ":$UI_PORT " || say "المنفذ $UI_PORT لا يستمع"
+    netstat -ltn 2>/dev/null | grep -E ":($UI_PORT|$UI_PORT_S) " || say "المنفذ $UI_PORT لا يستمع"
     say "--- عملية uhttpd ---"
     ps w 2>/dev/null | grep -v grep | grep uhttpd || say "لا توجد عملية uhttpd"
     say "--- الجدار الناري ---"
@@ -1447,7 +1457,9 @@ do_remove() {
     done
     drop_legacy_uhttpd
     uci -q delete uhttpd.xe3000 && uci commit uhttpd
-    uci -q delete firewall.xe3000_panel && uci commit firewall
+    uci -q delete firewall.xe3000_panel
+    uci -q delete firewall.xe3000_panel_s
+    uci commit firewall
     /etc/init.d/firewall reload >/dev/null 2>&1
     /etc/init.d/uhttpd reload >/dev/null 2>&1
     rm -rf "$BASE"
@@ -1459,7 +1471,7 @@ do_remove() {
 
 do_repair_ui() {
     need_root
-    [ -d "$UIROOT" ] || write_ui_files
+    write_ui_files          # دائمًا: الترقية يجب أن تحدّث الصفحات
     configure_uhttpd
 }
 
@@ -1468,7 +1480,7 @@ do_bootstrap() {
     write_ui_files
     set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
     configure_uhttpd
-    ok "افتح https://$(lan_ip):$UI_PORT/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
+    ok "افتح https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
 }
 
 # لا وسائط: يقرر وحده
@@ -1549,7 +1561,7 @@ do_menu() {
             5) do_diagnose; say ""; do_selftest || true ;;
             6) do_set_token || true ;;
             7) need_root; set_password 1 && configure_uhttpd ;;
-            8) say "https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi" ;;
+            8) say "https://$(lan_ip):$UI_PORT_S/cgi-bin/control.cgi  (أو http://$(lan_ip):$UI_PORT/)" ;;
             9) do_auto_self || true ;;
             0|q|Q) return 0 ;;
             *) warn "اختيار غير معروف." ;;
