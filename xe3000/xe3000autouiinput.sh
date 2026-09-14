@@ -1006,6 +1006,29 @@ do_auto_self() {
     do_bootstrap
 }
 
+# تبديل التوكن وحده — أشيع إصلاح بعد "Invalid API Token"
+do_set_token() {
+    need_root
+    need_cmd curl; need_cmd jsonfilter
+    creds_saved || die "لا توجد بيانات محفوظة. شغّل install أولًا."
+    load_creds
+    _t=${FULLTUNNEL_API_TOKEN:-}
+    [ -n "$_t" ] || read_tty "API Token الجديد: " _t 1
+    valid_id "$_t" || die "التوكن غير صالح أو فيه محرف زائد."
+    [ "$_t" = "$CF_TOKEN" ] && warn "التوكن الجديد مطابق للقديم المرفوض."
+    CF_TOKEN=$_t
+    printf '%s' "$CF_TOKEN" >"$CREDS/api-token"
+    chmod 600 "$CREDS/api-token"
+    ok "حُدِّث التوكن. المضيف والمعرّفان كما هما."
+    say ""
+    if preflight_cloudflare; then
+        say ""
+        ok "الفحوصات الأربعة نجحت — أكمل التثبيت: sh $SELF"
+        return 0
+    fi
+    return 1
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -1019,6 +1042,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF diagnose         فحص uhttpd والمنفذ $UI_PORT
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
   sh $SELF set-password     كلمة مرور اللوحة
+  sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
   sh $SELF preflight        فحوصات Cloudflare الأربعة
   sh $SELF creds-status     هل البيانات محفوظة
   sh $SELF forget-creds     حذفها نهائيًا
@@ -1041,6 +1065,7 @@ case "${1:-}" in
     diagnose)           do_diagnose ;;
     repair-ui)          do_repair_ui ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
+    set-token)          do_set_token ;;
     preflight)          need_root; need_cmd curl; need_cmd jsonfilter
                         collect_creds; preflight_cloudflare ;;
     creds-status)       creds_status ;;

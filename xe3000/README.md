@@ -90,7 +90,11 @@ cd /root && sha256sum -c /tmp/SHA256SUMS 2>/dev/null | grep -v 'No such file'
 (`POST accounts/<id>/cfd_tunnel`). كل ما قبلها يعمل: الحزم مثبتة، وبيانات
 Cloudflare محفوظة في `/etc/xe3000-cf-fulltunnel-creds`.
 
-**السبب الأرجح:** التوكن ينقصه صلاحية `Account · Cloudflare Tunnel · Edit`.
+**السبب المؤكَّد (12 سبتمبر):** الفحص 1 يردّ `Invalid API Token` — التوكن نفسه غير معروف
+لدى Cloudflare (محذوف أو منتهٍ أو منقوص عند اللصق). ليست مسألة صلاحية ناقصة: لو كانت
+كذلك لنجح الفحص 1 وسقط الفحص 4 وحده.
+
+سبق هذا عطل DNS على الراوتر كان يحجب الطلب قبل وصوله؛ أُصلح بضبط مُوجِّه DNS على WAN.
 
 **الخطوة التالية:** شغّل `sh /root/check-cloudflare.sh` على الراوتر، وخصوصًا الفحص
 رقم **4**. تفاصيل التشخيص في [سجل العمل](xe3000-fulltunnel-worklog.md).
@@ -156,6 +160,7 @@ sh xe3000autouiinput.sh status           # حالة البوابة والواج�
 sh xe3000autouiinput.sh diagnose         # فحص uhttpd والمنفذ 9000
 sh xe3000autouiinput.sh repair-ui        # إصلاح ربط HTTPS على LAN
 sh xe3000autouiinput.sh set-password     # كلمة مرور اللوحة
+sh xe3000autouiinput.sh set-token        # تبديل توكن Cloudflare وحده ثم فحصه
 sh xe3000autouiinput.sh creds-status     # هل البيانات محفوظة
 sh xe3000autouiinput.sh forget-creds     # حذفها نهائيًا
 sh xe3000autouiinput.sh reset            # حذف بقايا تثبيت ناقص
