@@ -1073,7 +1073,8 @@ fi
 EPATH=$(printf '%s' "$PATHV" | sed 's|/|%2F|g')
 [ -s "$CREDS/api-token" ] && CRED=محفوظة || CRED="غير محفوظة"
 
-printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
+printf 'Content-Type: text/html; charset=utf-8\r\n'
+printf 'Cache-Control: no-store, must-revalidate\r\n\r\n'
 cat <<HTML
 <!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1104,6 +1105,7 @@ input{padding:8px;border-radius:6px;border:1px solid #444;background:#0d0d0d;col
 .warn{color:#ff9a9a}
 </style><div class="c">
 <h1>XE3000 Cloudflare Full-Tunnel</h1>
+<p class="uid">اللوحة: @PANELVER@</p>
 HTML
 [ -n "$MSG" ] && { printf '<div class="%s">' "$CLS"; printf '%s' "$MSG" | esc; printf '</div>'; }
 
@@ -1274,6 +1276,7 @@ printf '<p><a href="control.cgi">لوحة التحكم</a></p></div>'
 UISETUP
     sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/setup.cgi"
     sed -i "s#@SELF@#$SELF_ABS#" "$UIROOT/cgi-bin/control.cgi"
+    sed -i "s#@PANELVER@#$VERSION ($(date -u '+%Y-%m-%d %H:%M')Z)#" "$UIROOT/cgi-bin/control.cgi"
     write_qrlib
     awk -v f="$UIROOT/qr.js" '/@QRLIB@/{while((getline l < f)>0) print l; next} {print}' \
         "$UIROOT/cgi-bin/control.cgi" >"$UIROOT/cgi-bin/control.cgi.new" &&
