@@ -1678,16 +1678,29 @@ do_selftest() {
         *"Connection refused"*)
             err "الاتصال مرفوض على $XRAY_LISTEN:$XRAY_PORT — لا شيء يستمع فعلًا."
             _lo=1; _fail=1 ;;
-        *"timed out"*|*"Timeout"*)
+        *"timed out"*|*"Timeout"*|*"Connection timeout"*)
             err "انتهت مهلة الاتصال بـ $XRAY_LISTEN:$XRAY_PORT رغم أن المنفذ مستمع."
-            say "    مصافحة TCP لا تكتمل — حزم لا تصل أو لا تعود."
+            say "    SYN يصل ولا يعود SYN-ACK: المقبس لا يقبل الاتصالات"
+            say "    (طابور ممتلئ أو عملية عالقة) — ليس جدارًا ناريًا."
+            # ضابط: خادم الويب المحلي يفصل بين عطل عام في loopback وعطل في xray
+            _ctl=$(curl -sS --noproxy '*' --connect-timeout 4 -o /dev/null \
+                   -w '%{http_code}' "http://127.0.0.1:80/" 2>&1)
+            case "$_ctl" in
+                [1-5][0-9][0-9])
+                    err "    الضابط: 127.0.0.1:80 ردّ $_ctl — loopback سليم، العطل في xray وحده."
+                    say "        جرّب: /etc/init.d/xe3000-cf-xray restart" ;;
+                *)  warn "    الضابط: 127.0.0.1:80 فشل أيضًا ($_ctl) — loopback معطوب لكل الخدمات." ;;
+            esac
+            say "    ── طابور الاستماع ──"
+            netstat -ant 2>/dev/null | grep ":$XRAY_PORT " | head -5
+            netstat -s 2>/dev/null | grep -iE 'listen|overflow' | head -4
             _lo=1; _fail=1 ;;
         curl:*)
             err "تعذر الاتصال: $_t"; _lo=1; _fail=1 ;;
         *)
             ok "مصافحة TCP اكتملت ($_t)" ;;
     esac
-    if [ "${_lo:-0}" = 1 ] || [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
+    if [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
         # EPERM على حزمة محلية = إسقاط في LOCAL_OUT، فالدليل في سلسلة OUTPUT
         say "    ── conntrack ──"
         _cc=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
@@ -1738,7 +1751,7 @@ do_selftest() {
         curl:*) err "curl لم يصل إلى $XRAY_LISTEN:$XRAY_PORT — $_h"
                 case "$_h" in
                   *"Connection timed out"*)
-                      say "    مهلة في مصافحة TCP على منفذ مستمع = حزم تُسقَط." ;;
+                      say "    مهلة على منفذ مستمع = المقبس لا يردّ بـ SYN-ACK." ;;
                   *"Connection refused"*)
                       say "    رفض اتصال = لا شيء يستمع فعلًا على هذا المنفذ." ;;
                 esac
