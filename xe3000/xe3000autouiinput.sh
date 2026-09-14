@@ -1683,10 +1683,22 @@ do_selftest() {
     fi
     if [ "${_lo:-0}" = 1 ] || [ "${FULLTUNNEL_SHOW_RULES:-0}" = 1 ]; then
         # EPERM على حزمة محلية = إسقاط في LOCAL_OUT، فالدليل في سلسلة OUTPUT
-        say "    ── OUTPUT (filter) مع العدّادات بعد محاولة اتصال ──"
+        say "    ── conntrack ──"
+        _cc=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+        _cm=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+        if [ -n "$_cc" ] && [ -n "$_cm" ]; then
+            say "    مستخدم $_cc من $_cm"
+            [ "$_cc" -ge $(( _cm - _cm / 10 )) ] && \
+                err "    جدول conntrack شبه ممتلئ — يُسقط الاتصالات الجديدة بـ EPERM."
+        fi
+        dmesg 2>/dev/null | grep -iE 'conntrack|table full' | tail -5
+
+        say "    ── INPUT/OUTPUT (filter) مع العدّادات بعد محاولة اتصال ──"
         iptables -Z OUTPUT >/dev/null 2>&1
+        iptables -Z INPUT  >/dev/null 2>&1
         ( nc -w 2 -z "$XRAY_LISTEN" "$XRAY_PORT" >/dev/null 2>&1 || true )
-        iptables -L OUTPUT -n -v --line-numbers 2>/dev/null | head -25 || say "    (iptables غير متاح)"
+        iptables -L INPUT  -n -v --line-numbers 2>/dev/null | head -18 || say "    (iptables غير متاح)"
+        iptables -L OUTPUT -n -v --line-numbers 2>/dev/null | head -18
         say "    ── OUTPUT (mangle) ──"
         iptables -t mangle -L OUTPUT -n -v --line-numbers 2>/dev/null | head -20
         say "    ── mangle: السلاسل الفرعية بعدّاداتها ──"
