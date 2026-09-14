@@ -169,6 +169,24 @@ sh /root/xe3000autouiinput.sh repair-ui    # يعيد بناء قسم uhttpd و�
 
 ---
 
+## الناقل: ws أم xhttp
+
+```sh
+xe3000 set-transport xhttp     # أو ws
+```
+
+`ws` يحتاج ترقية HTTP، و**cloudflared لا يمرّر الترقية إلى أصل من نوع `unix:`** فيردّ 502
+بينما الطلبات العادية تمر. `xhttp` يستعمل HTTP عاديًا بلا ترقية فيعبر.
+
+| الحالة | الناقل الصالح |
+|---|---|
+| xray على TCP (`set-listen <ip>`) | `ws` أو `xhttp` |
+| xray على مقبس Unix (`set-listen unix`) | **`xhttp`** |
+
+تبديل الناقل يغيّر روابط العملاء — أعد استيرادها بـ `xe3000 links` أو من رمز QR في اللوحة.
+
+---
+
 ## المستخدمون والروابط ورموز QR
 
 ### لوحة 9000

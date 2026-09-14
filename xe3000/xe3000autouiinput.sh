@@ -25,7 +25,7 @@ esac
 
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
-XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=
+XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -393,9 +393,13 @@ user_del() { # $1 اسم أو uuid
 }
 
 user_link() { # $1 uuid  $2 الاسم
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=ws&host=%s&path=%s#%s' \
-        "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "$CF_HOSTNAME" \
-        "$(printf '%s' "$XRAY_WSPATH" | sed 's|/|%2F|g')" "$2"
+    _ep=$(printf '%s' "$XRAY_WSPATH" | sed 's|/|%2F|g')
+    case "${XRAY_NET:-ws}" in
+        xhttp) _extra='&mode=auto' ;;
+        *)     _extra= ;;
+    esac
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
+        "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2"
 }
 
 users_links() {
@@ -463,6 +467,11 @@ write_xray_config() {
         _addr="\"listen\": \"$XRAY_LISTEN\", \"port\": $XRAY_PORT,"
         _sock=
     fi
+    # xhttp لا يستعمل ترقية HTTP، فيمرّ عبر cloudflared إلى أصل unix بخلاف ws
+    case "${XRAY_NET:-ws}" in
+        xhttp) _stream="\"network\": \"xhttp\", \"xhttpSettings\": { \"path\": \"$XRAY_WSPATH\", \"mode\": \"auto\" }" ;;
+        *)     _stream="\"network\": \"ws\", \"wsSettings\": { \"path\": \"$XRAY_WSPATH\" }" ;;
+    esac
     cat >"$XRAY_DIR/config.json.new" <<XRAYCFG
 {
   "log": { "loglevel": "warning" },
@@ -471,7 +480,7 @@ write_xray_config() {
       $_addr
       "protocol": "vless",
       "settings": { "clients": [ $_clients ], "decryption": "none" },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "$XRAY_WSPATH" }$_sock }
+      "streamSettings": { $_stream$_sock }
     }
   ],
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
@@ -534,6 +543,7 @@ write_configs() {
 
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-18443}
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
+    XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
     users_init
     if [ ! -s "$USERS" ]; then
@@ -595,6 +605,7 @@ FULLTUNNEL_TUNNEL_ID=$TUNNEL_ID
 FULLTUNNEL_TUNNEL_NAME=$TUNNEL_NAME
 FULLTUNNEL_XRAY_PORT=$XRAY_PORT
 FULLTUNNEL_XRAY_LISTEN=$XRAY_LISTEN
+FULLTUNNEL_XRAY_NET=${XRAY_NET:-ws}
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -611,6 +622,7 @@ load_settings() {
     TUNNEL_NAME=${FULLTUNNEL_TUNNEL_NAME:-}
     XRAY_PORT=${FULLTUNNEL_XRAY_PORT:-}
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
+    XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
@@ -1710,9 +1722,10 @@ do_selftest() {
         _cl=$(jf "$_j" '@.inbounds[0].listen')
         _cpr=$(jf "$_j" '@.inbounds[0].protocol')
         say "    protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
+        _cw=${_cw:-$(jf "$_j" '@.inbounds[0].streamSettings.xhttpSettings.path')}
         say "    path في config.json : $_cw"
         say "    path في settings.env: $XRAY_WSPATH"
-        [ "$_cn" = ws ]           || { err "network ليس ws — الترقية لن تنجح أبدًا."; _fail=1; }
+        case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
         [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
         is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
     else
@@ -1937,6 +1950,21 @@ do_set_listen() {
     say "تحقق: sh $SELF selftest"
 }
 
+# ws يحتاج ترقية HTTP وcloudflared لا يمرّرها إلى أصل unix؛ xhttp لا يحتاجها
+do_set_transport() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    case "${1:-}" in
+        ws|xhttp) XRAY_NET=$1 ;;
+        *) die "الناقل: ws أو xhttp" ;;
+    esac
+    save_settings
+    users_apply
+    ok "الناقل الآن: $XRAY_NET"
+    warn "روابط العملاء تغيّرت — أعد استيرادها من: sh $SELF links"
+    say "أو من اللوحة برمز QR."
+}
+
 usage() {
     cat <<USAGE
 XE3000 Cloudflare Full-Tunnel — $VERSION
@@ -1951,7 +1979,8 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
-  sh $SELF set-listen [عنوان] ربط xray على عنوان آخر (مخرج عطل loopback)
+  sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
+  sh $SELF set-transport <ws|xhttp>  تبديل الناقل
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -1983,6 +2012,7 @@ case "${1:-}" in
     set-token)          do_set_token ;;
     selftest)           do_selftest ;;
     set-listen)         do_set_listen "${2:-}" ;;
+    set-transport)      do_set_transport "${2:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
