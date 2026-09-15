@@ -447,6 +447,9 @@ cfd_service() {
 }
 
 write_cfd_config() {
+    # حارس: منادٍ نسي load_settings كان يولّد "service: http://:" فيرفضه cloudflared
+    [ -n "$TUNNEL_ID" ] && [ -n "$CF_HOSTNAME" ] ||
+        die "لا يمكن كتابة إعداد cloudflared بلا معرّف نفق واسم مضيف — حمّل الإعدادات أولًا."
     mkdir -p "$CFD_DIR"
     # أصل unix: بلا اسم مضيف يجعل cloudflared يفشل بـ "no Host in request URL"
     if is_sock; then
@@ -2490,6 +2493,9 @@ do_set_edge_proto() {
 
 do_vpn_bypass() {
     need_root
+    # بلا هذا تكون كل القيم فارغة، فيولّد write_cfd_config إعدادًا بلا مضيف.
+    # الأمر يُستعمل قبل التثبيت أيضًا، فغياب الإعدادات ليس خطأً بذاته.
+    load_settings 2>/dev/null || true
     _cron=/etc/crontabs/root
     case "${1:-auto}" in
         auto|on|1)
@@ -2522,6 +2528,10 @@ do_vpn_bypass() {
             else
                 # بلا مقياس لا قرار: تأكّد أن /ready يجيب قبل إعلان أي شيء
                 if ! cfd_ready_ok; then
+                    [ -n "$TUNNEL_ID" ] && [ -n "$CF_HOSTNAME" ] || {
+                        add_bypass_now
+                        die "لا يوجد تثبيت مكتمل — الوضع التلقائي يحتاج نفقًا قائمًا.
+    أبقيتُ التجاوز مفعّلًا. ثبّت أولًا: sh $SELF auto"; }
                     say "منفذ المقاييس غير مهيّأ في إعداد cloudflared — أضيفه الآن."
                     write_cfd_config
                     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
