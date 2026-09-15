@@ -1557,7 +1557,7 @@ net_check() {
         if ip rule 2>/dev/null | grep -q 'blackhole' || ip link show tun0 >/dev/null 2>&1; then
             say "    على الجهاز سياسة VPN (قاعدة blackhole أو واجهة tun0):"
             say "    الأرجح أن استعلاماتك تُدفع إلى نفق ساقط. العلاج:"
-            say "      sh $SELF vpn-bypass on"
+            say "      sh $SELF vpn-bypass auto"
         fi
         say "    وتحقق من dnsmasq: /etc/init.d/dnsmasq status ثم logread -e dnsmasq"
         return 1
@@ -2218,43 +2218,124 @@ do_watchdog() {
 
 # كِل‑سويتش WireGuard يوجّه كل مرور الراوتر إلى النفق ويحجب ما عداه، فيسقط
 # اتصال cloudflared بحافة Cloudflare. نعلّم مروره ليخرج مباشرة عبر WAN.
-# المنافذ التي تحتاجها البوابة من الراوتر نفسه:
+# المنافذ التي يحتاجها الراوتر نفسه حين يسقط مسار الـ VPN:
 #   7844 tcp/udp  اتصال cloudflared بحافة Cloudflare
 #   53   udp/tcp  ترجمة الأسماء — بدونها لا يصل cloudflared ولا API إلى أي مضيف
 #   443  tcp      Cloudflare API وتنزيل الملفات الثنائية والتحديث الذاتي
 #   80   tcp      opkg ومرايا الحزم
 FW_BYPASS_PORTS='tcp:7844 udp:7844 udp:53 tcp:53 tcp:443 tcp:80'
+BYPASS_MODE="$BASE/state/vpn-bypass.mode"
 
+# الملف المولَّد هو مصدر القرار الوحيد: يعمل من include الجدار الناري عند الإقلاع
+# ومن cron دوريًا، فلا يتكرّر المنطق في مكانين.
 write_fwinclude() {
-    # vpn-bypass يُشغَّل غالبًا قبل التثبيت أو بعد remove، فالمجلّد قد لا يوجد
-    mkdir -p "$BASE" || die "تعذر إنشاء $BASE"
+    mkdir -p "$BASE" "$STATE" || die "تعذر إنشاء $BASE"
     chmod 700 "$BASE" 2>/dev/null
     {
     cat <<'FWIHEAD'
 #!/bin/sh
-# سياسة VPN في GL.iNet (rtp2.sh) تدفع كل ما ينشئه الراوتر إلى جدول التوجيه 2022،
-# ومساره الافتراضي عبر tun0. إن كان النفق ساقطًا ضاعت الحزم أو ابتلعتها قاعدة
-# blackhole عند الأولوية 9910، فيظهر ذلك كـ "Operation not permitted" أو مهلة.
-# العلامة 0x8000 تلتقطها قاعدة ip rule ذات الأولوية 6000 فتذهب الحزمة إلى
-# الجدول main مباشرة عبر منفذ الإنترنت.
+# سياسة VPN في GL.iNet (rtp2.sh) تدفع كل ما ينشئه الراوتر إلى جدول سياسة
+# مساره الافتراضي عبر نفق VPN. هذا هو المطلوب ما دام النفق يعمل: النفق العام
+# لا يصل إلى Cloudflare إلا عبره. لكن إن سقط النفق ضاعت الحزم أو ابتلعتها
+# قاعدة blackhole، فيظهر ذلك كـ "Operation not permitted" أو مهلة.
+#
+# لذلك: العلامة 0x8000 (تلتقطها قاعدة ip rule ذات الأولوية 6000 فتذهب الحزمة
+# إلى الجدول main مباشرة) تُوضع فقط حين يكون مسار الـ VPN ساقطًا، وتُرفع فور
+# عودته. الوضع في state/vpn-bypass.mode: auto (الافتراضي) أو on أو off.
+#
 # mangle/OUTPUT لا يرى إلا ما ينشئه الراوتر: مرور أجهزة الشبكة يمرّ بـ FORWARD،
 # فكِل‑سويتش أجهزتك لا يتأثر بهذا الملف إطلاقًا.
 FWIHEAD
-    printf 'for _e in %s; do\n' "$FW_BYPASS_PORTS"
+    printf 'PORTS="%s"\n' "$FW_BYPASS_PORTS"
+    printf 'MODEF="%s"\n' "$BYPASS_MODE"
+    printf 'TUNSVC="%s"\n' "/etc/init.d/xe3000-cf-tunnel"
     cat <<'FWIBODY'
-    _pr=${_e%%:*}; _pt=${_e##*:}
-    iptables -w -t mangle -C OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
-        -j MARK --set-xmark 0x8000/0xf000 2>/dev/null ||
-    iptables -w -t mangle -I OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
-        -j MARK --set-xmark 0x8000/0xf000
-done
+
+_rule() { # $1=عملية $2=بروتوكول $3=منفذ
+    iptables -w -t mangle "$1" OUTPUT -p "$2" --dport "$3" -m mark --mark 0x0/0xf000 \
+        -j MARK --set-xmark 0x8000/0xf000 2>/dev/null
+}
+add_rules() { for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" || _rule -I "${_e%%:*}" "${_e##*:}"; done; }
+del_rules() { for _e in $PORTS; do while _rule -D "${_e%%:*}" "${_e##*:}"; do :; done; done; }
+count_rules() {
+    _n=0
+    for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" && _n=$((_n+1)); done
+    echo "$_n"
+}
+total_rules() { set -- $PORTS; echo $#; }
+
+# المسار الافتراضي داخل جداول السياسة: "بوابة جهاز"
+vpn_route() {
+    for _t in $(ip rule 2>/dev/null | sed -n 's/.*lookup \([0-9][0-9]*\).*/\1/p' | sort -un); do
+        ip route show table "$_t" 2>/dev/null | awk '/^default via /{print $3" "$5; exit}'
+    done | grep -E ' (tun|wg|ppp|ovpn|vti)' | head -1
+}
+
+# up = النفق حيّ فمرّر عبره، down = ساقط فتجاوزه، none = لا نفق أصلًا
+vpn_state() {
+    _r=$(vpn_route)
+    [ -n "$_r" ] || { echo none; return; }
+    _gw=${_r%% *}; _dev=${_r##* }
+    ip link show "$_dev" >/dev/null 2>&1 || { echo down; return; }
+    case "$_dev" in
+        wg*)
+            _h=$(wg show "$_dev" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+            if [ -n "$_h" ] && [ "$_h" -gt 0 ] && [ $(( $(date +%s) - _h )) -lt 240 ]; then
+                echo up
+            else
+                echo down
+            fi ;;
+        *)  ping -c1 -W2 "$_gw" >/dev/null 2>&1 && echo up || echo down ;;
+    esac
+}
+
+kill_switch() { ip rule 2>/dev/null | grep -q blackhole; }
+
+MODE=$(cat "$MODEF" 2>/dev/null)
+[ -n "$MODE" ] || MODE=auto
+case "$MODE" in
+    on)  add_rules; exit 0 ;;
+    off) del_rules; exit 0 ;;
+esac
+
+_st=$(vpn_state)
+case "$_st" in
+    up)   _want=0 ;;
+    down) _want=1 ;;
+    *)    kill_switch && _want=1 || _want=0 ;;
+esac
+
+_now=$(count_rules); _all=$(total_rules); _changed=0
+if [ "$_want" = 1 ]; then
+    [ "$_now" = "$_all" ] || {
+        add_rules; _changed=1
+        logger -t xe3000 "vpn-bypass: مسار VPN ($_st) — فُعّل التجاوز المباشر"
+    }
+else
+    [ "$_now" = 0 ] || {
+        del_rules; _changed=1
+        logger -t xe3000 "vpn-bypass: مسار VPN ($_st) — رُفع التجاوز، المرور يسلك الـ VPN"
+    }
+fi
+
+# تبديل المسار يقطع وصلة cloudflared القائمة: أعد تشغيلها لتتصل عبر المسار الجديد
+[ "$_changed" = 1 ] && [ -x "$TUNSVC" ] && "$TUNSVC" restart >/dev/null 2>&1
+exit 0
 FWIBODY
     } >"$BASE/firewall.sh" || die "تعذر كتابة $BASE/firewall.sh"
     [ -s "$BASE/firewall.sh" ] || die "$BASE/firewall.sh كُتب فارغًا"
     chmod 750 "$BASE/firewall.sh"
 }
 
-# عدد القواعد الموجودة فعلًا في mangle/OUTPUT
+fw_bypass_del() {
+    for _e in $FW_BYPASS_PORTS; do
+        _pr=${_e%%:*}; _pt=${_e##*:}
+        while iptables -w -t mangle -D OUTPUT -p "$_pr" --dport "$_pt" \
+                -m mark --mark 0x0/0xf000 -j MARK --set-xmark 0x8000/0xf000 2>/dev/null; do :; done
+    done
+}
+
+# لا تُقرأ الحالة من مخرجات السكربت المولَّد بل من الجدول نفسه
 fw_bypass_count() {
     _n=0
     for _e in $FW_BYPASS_PORTS; do
@@ -2265,20 +2346,16 @@ fw_bypass_count() {
     printf '%s' "$_n"
 }
 
-fw_bypass_total() { printf '%s' "$FW_BYPASS_PORTS" | wc -w | tr -d ' '; }
-
-fw_bypass_del() {
-    for _e in $FW_BYPASS_PORTS; do
-        _pr=${_e%%:*}; _pt=${_e##*:}
-        while iptables -w -t mangle -D OUTPUT -p "$_pr" --dport "$_pt" \
-                -m mark --mark 0x0/0xf000 -j MARK --set-xmark 0x8000/0xf000 2>/dev/null; do :; done
-    done
-}
+fw_bypass_total() { set -- $FW_BYPASS_PORTS; printf '%s' "$#"; }
 
 do_vpn_bypass() {
     need_root
-    case "${1:-on}" in
-        on|1)
+    _cron=/etc/crontabs/root
+    case "${1:-auto}" in
+        auto|on|1)
+            case "${1:-auto}" in on|1) _mode=on ;; *) _mode=auto ;; esac
+            mkdir -p "$STATE" || die "تعذر إنشاء $STATE"
+            printf '%s\n' "$_mode" >"$BYPASS_MODE"
             write_fwinclude
             uci -q delete firewall.xe3000_inc
             uci set firewall.xe3000_inc=include
@@ -2286,26 +2363,70 @@ do_vpn_bypass() {
             uci set firewall.xe3000_inc.reload=1
             uci commit firewall
             sh "$BASE/firewall.sh" || die "تعذر تطبيق قواعد التجاوز"
-            # لا تُعلن النجاح من مخرجات السكربت: اقرأ الجدول نفسه.
-            _have=$(fw_bypass_count); _want=$(fw_bypass_total)
-            [ "$_have" = "$_want" ] ||
-                die "طُبّقت $_have من $_want قاعدة فقط — راجع: iptables -t mangle -L OUTPUT -n -v"
-            ok "مرور الراوتر نحو المنافذ 53 و80 و443 و7844 يتجاوز سياسة VPN ($_have/$_want)"
-            say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
-            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز."
-            if nslookup api.cloudflare.com >/dev/null 2>&1; then
-                ok "تحقّق: الراوتر صار يترجم api.cloudflare.com"
+
+            # في الوضع التلقائي تُعاد المراجعة دوريًا: النفق قد يسقط أو يعود
+            mkdir -p /etc/crontabs; touch "$_cron"
+            sed -i "\\#$BASE/firewall.sh#d" "$_cron"
+            if [ "$_mode" = auto ]; then
+                printf '*/%s * * * * %s/firewall.sh\n' "${2:-2}" "$BASE" >>"$_cron"
+                /etc/init.d/cron enable  >/dev/null 2>&1
+                /etc/init.d/cron restart >/dev/null 2>&1
+            fi
+
+            _have=$(fw_bypass_count); _all=$(fw_bypass_total); _st=$(vpn_link_state)
+            if [ "$_mode" = on ]; then
+                [ "$_have" = "$_all" ] ||
+                    die "طُبّقت $_have من $_all قاعدة فقط — راجع: iptables -t mangle -L OUTPUT -n -v"
+                ok "تجاوز دائم: مرور الراوتر نحو 53 و80 و443 و7844 يخرج مباشرة ($_have/$_all)"
+                warn "دائم يعني أن النفق لن يسلك الـ VPN حتى وهو يعمل. للسلوك الذكي: vpn-bypass auto"
             else
-                warn "ما زالت الترجمة تفشل — شغّل: sh $SELF diagnose"
-            fi ;;
+                ok "الوضع التلقائي مفعّل — يُراجَع كل ${2:-2} دقيقة"
+                case "$_st" in
+                    up)   ok "مسار VPN يعمل — المرور يسلك الـ VPN، بلا تجاوز ($_have/$_all)" ;;
+                    down) ok "مسار VPN ساقط — التجاوز مفعّل مؤقتًا ($_have/$_all)، ويُرفع فور عودته" ;;
+                    *)    say "لا أرى نفق VPN في جداول السياسة — التجاوز $( [ "$_have" = 0 ] && echo معطّل || echo مفعّل )" ;;
+                esac
+            fi
+            say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
+            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز." ;;
         off|0)
             uci -q delete firewall.xe3000_inc && uci commit firewall
+            [ -f "$_cron" ] && sed -i "\\#$BASE/firewall.sh#d" "$_cron"
+            /etc/init.d/cron restart >/dev/null 2>&1
             fw_bypass_del
             rm -f "$BASE/firewall.sh"
+            printf 'off\n' >"$BYPASS_MODE" 2>/dev/null
             _left=$(fw_bypass_count)
             [ "$_left" = 0 ] || warn "بقيت $_left قاعدة — راجع: iptables -t mangle -L OUTPUT -n -v"
-            ok "أُلغي التجاوز" ;;
-        *) die "الاستعمال: vpn-bypass on|off" ;;
+            ok "أُلغي التجاوز — كل مرور الراوتر يسلك سياسة الـ VPN" ;;
+        status)
+            _m=$(cat "$BYPASS_MODE" 2>/dev/null); [ -n "$_m" ] || _m="(غير مضبوط)"
+            say "الوضع    : $_m"
+            say "مسار VPN : $(vpn_link_state)"
+            say "القواعد  : $(fw_bypass_count)/$(fw_bypass_total)"
+            grep -qF "$BASE/firewall.sh" "$_cron" 2>/dev/null &&
+                say "المراجعة : مجدولة في cron" || say "المراجعة : غير مجدولة" ;;
+        *) die "الاستعمال: vpn-bypass auto|on|off|status" ;;
+    esac
+}
+
+# نفس منطق الملف المولَّد، للعرض في الطرفية
+vpn_link_state() {
+    [ -x "$BASE/firewall.sh" ] || { printf 'غير معروف (لم يُكتب الملف بعد)'; return; }
+    _r=$(for _t in $(ip rule 2>/dev/null | sed -n 's/.*lookup \([0-9][0-9]*\).*/\1/p' | sort -un); do
+            ip route show table "$_t" 2>/dev/null | awk '/^default via /{print $3" "$5; exit}'
+         done | grep -E ' (tun|wg|ppp|ovpn|vti)' | head -1)
+    [ -n "$_r" ] || { printf none; return; }
+    _gw=${_r%% *}; _dev=${_r##* }
+    ip link show "$_dev" >/dev/null 2>&1 || { printf down; return; }
+    case "$_dev" in
+        wg*) _h=$(wg show "$_dev" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+             if [ -n "$_h" ] && [ "$_h" -gt 0 ] && [ $(( $(date +%s) - _h )) -lt 240 ]; then
+                 printf up
+             else
+                 printf down
+             fi ;;
+        *)   ping -c1 -W2 "$_gw" >/dev/null 2>&1 && printf up || printf down ;;
     esac
 }
 
@@ -2330,7 +2451,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-protocol <vless|trojan>  تبديل البروتوكول
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
-  sh $SELF vpn-bypass on|off  تجاوز كِل‑سويتش WireGuard
+  sh $SELF vpn-bypass auto|on|off|status  تجاوز سياسة VPN عند سقوط النفق فقط
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
@@ -2369,7 +2490,7 @@ case "${1:-}" in
     set-protocol)       do_set_protocol "${2:-}" ;;
     ssh-ws)             do_sshws "${2:-}" ;;
     watchdog)           do_watchdog "${2:-}" "${3:-}" ;;
-    vpn-bypass)         do_vpn_bypass "${2:-on}" ;;
+    vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
