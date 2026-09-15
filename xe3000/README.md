@@ -264,6 +264,39 @@ sh /root/check-cloudflare.sh <token> <account-id> <zone-id>
 sh /root/xe3000autouiinput.sh preflight
 ```
 
+### سياسة VPN تبتلع مرور الراوتر — `ping` ينجح وDNS يفشل
+
+على GL.iNet، الملف `/usr/bin/rtp2.sh` (عبر `firewall.vpnclient`) يبني سياسة توجيه
+تدفع **كل ما ينشئه الراوتر** إلى الجدول `2022`، ومساره الافتراضي عبر `tun0`. إن كان
+النفق ساقطًا ضاعت الحزم، أو ابتلعتها قاعدة `blackhole` عند الأولوية 9910.
+
+العرَض مميّز: `ping 1.1.1.1` ينجح، بينما `nslookup` يعطي مهلة و`wget` يعطي
+`Failed to send request: Operation not permitted`. المشكلة في **التوجيه** لا في
+الجدار الناري — `iptables -t filter -L OUTPUT` يكون نظيفًا.
+
+```sh
+ip rule                      # ابحث عن blackhole عند 9910 و9920
+ip route show table 2022     # default via ... dev tun0
+wg show                      # فارغ ⇦ النفق ليس WireGuard بل OpenVPN
+```
+
+العلاج:
+
+```sh
+sh /root/xe3000autouiinput.sh vpn-bypass on
+```
+
+يضع العلامة `0x8000` على ما ينشئه الراوتر نحو 53 و80 و443 و7844، فتلتقطها قاعدة
+`ip rule` ذات الأولوية 6000 وتذهب الحزمة إلى الجدول `main` مباشرة عبر منفذ
+الإنترنت. يُكتب في `include` تابع للجدار الناري فيصمد بعد إعادة تشغيله وبعد إقلاع
+الجهاز، ويتحقق من نفسه بترجمة `api.cloudflare.com` بعد التطبيق.
+
+**لا يمسّ كِل‑سويتش أجهزتك:** سلسلة `mangle/OUTPUT` لا ترى إلا ما ينشئه الراوتر؛
+مرور أجهزة شبكتك يمرّ بـ `FORWARD` ويبقى محكومًا بالسياسة كما هو. لكن انتبه أن
+مرور الراوتر نفسه على هذه المنافذ الأربعة صار يخرج مباشرة لا عبر الـ VPN.
+
+للتراجع: `sh /root/xe3000autouiinput.sh vpn-bypass off`.
+
 ---
 
 ## مرجع الأوامر

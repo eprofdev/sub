@@ -1552,7 +1552,14 @@ net_check() {
         return 1
     else
         err "لا DNS إطلاقًا — حتى الاستعلام المباشر من 1.1.1.1 يفشل."
-        say "    تحقق من dnsmasq: /etc/init.d/dnsmasq status ثم logread -e dnsmasq"
+        # ping ينجح وDNS يفشل = الحزم تُوجَّه لا تُحجب. سياسة VPN في GL.iNet
+        # تدفع ما ينشئه الراوتر إلى tun0، فإن كان النفق ساقطًا ضاع كل شيء.
+        if ip rule 2>/dev/null | grep -q 'blackhole' || ip link show tun0 >/dev/null 2>&1; then
+            say "    على الجهاز سياسة VPN (قاعدة blackhole أو واجهة tun0):"
+            say "    الأرجح أن استعلاماتك تُدفع إلى نفق ساقط. العلاج:"
+            say "      sh $SELF vpn-bypass on"
+        fi
+        say "    وتحقق من dnsmasq: /etc/init.d/dnsmasq status ثم logread -e dnsmasq"
         return 1
     fi
 
@@ -2211,18 +2218,44 @@ do_watchdog() {
 
 # كِل‑سويتش WireGuard يوجّه كل مرور الراوتر إلى النفق ويحجب ما عداه، فيسقط
 # اتصال cloudflared بحافة Cloudflare. نعلّم مروره ليخرج مباشرة عبر WAN.
+# المنافذ التي تحتاجها البوابة من الراوتر نفسه:
+#   7844 tcp/udp  اتصال cloudflared بحافة Cloudflare
+#   53   udp/tcp  ترجمة الأسماء — بدونها لا يصل cloudflared ولا API إلى أي مضيف
+#   443  tcp      Cloudflare API وتنزيل الملفات الثنائية والتحديث الذاتي
+#   80   tcp      opkg ومرايا الحزم
+FW_BYPASS_PORTS='tcp:7844 udp:7844 udp:53 tcp:53 tcp:443 tcp:80'
+
 write_fwinclude() {
-    cat >"$BASE/firewall.sh" <<'FWI'
+    {
+    cat <<'FWIHEAD'
 #!/bin/sh
-# اتصال cloudflared بالحافة على 7844 يخرج مباشرة، فلا يقطعه كِل‑سويتش VPN
-for _p in tcp udp; do
-    iptables -w -t mangle -C OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
+# سياسة VPN في GL.iNet (rtp2.sh) تدفع كل ما ينشئه الراوتر إلى جدول التوجيه 2022،
+# ومساره الافتراضي عبر tun0. إن كان النفق ساقطًا ضاعت الحزم أو ابتلعتها قاعدة
+# blackhole عند الأولوية 9910، فيظهر ذلك كـ "Operation not permitted" أو مهلة.
+# العلامة 0x8000 تلتقطها قاعدة ip rule ذات الأولوية 6000 فتذهب الحزمة إلى
+# الجدول main مباشرة عبر منفذ الإنترنت.
+# mangle/OUTPUT لا يرى إلا ما ينشئه الراوتر: مرور أجهزة الشبكة يمرّ بـ FORWARD،
+# فكِل‑سويتش أجهزتك لا يتأثر بهذا الملف إطلاقًا.
+FWIHEAD
+    printf 'for _e in %s; do\n' "$FW_BYPASS_PORTS"
+    cat <<'FWIBODY'
+    _pr=${_e%%:*}; _pt=${_e##*:}
+    iptables -w -t mangle -C OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
         -j MARK --set-xmark 0x8000/0xf000 2>/dev/null ||
-    iptables -w -t mangle -I OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
+    iptables -w -t mangle -I OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
         -j MARK --set-xmark 0x8000/0xf000
 done
-FWI
+FWIBODY
+    } >"$BASE/firewall.sh"
     chmod 750 "$BASE/firewall.sh"
+}
+
+fw_bypass_del() {
+    for _e in $FW_BYPASS_PORTS; do
+        _pr=${_e%%:*}; _pt=${_e##*:}
+        while iptables -w -t mangle -D OUTPUT -p "$_pr" --dport "$_pt" \
+                -m mark --mark 0x0/0xf000 -j MARK --set-xmark 0x8000/0xf000 2>/dev/null; do :; done
+    done
 }
 
 do_vpn_bypass() {
@@ -2236,14 +2269,17 @@ do_vpn_bypass() {
             uci set firewall.xe3000_inc.reload=1
             uci commit firewall
             sh "$BASE/firewall.sh"
-            ok "مرور cloudflared يتجاوز كِل‑سويتش VPN (منفذ 7844 مباشر)"
-            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز." ;;
+            ok "مرور الراوتر نحو المنافذ 53 و80 و443 و7844 يتجاوز سياسة VPN"
+            say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
+            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز."
+            if nslookup api.cloudflare.com >/dev/null 2>&1; then
+                ok "تحقّق: الراوتر صار يترجم api.cloudflare.com"
+            else
+                warn "ما زالت الترجمة تفشل — شغّل: sh $SELF diagnose"
+            fi ;;
         off|0)
             uci -q delete firewall.xe3000_inc && uci commit firewall
-            for _p in tcp udp; do
-                iptables -w -t mangle -D OUTPUT -p $_p --dport 7844 -m mark --mark 0x0/0xf000 \
-                    -j MARK --set-xmark 0x8000/0xf000 2>/dev/null
-            done
+            fw_bypass_del
             rm -f "$BASE/firewall.sh"
             ok "أُلغي التجاوز" ;;
         *) die "الاستعمال: vpn-bypass on|off" ;;
