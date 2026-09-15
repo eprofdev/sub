@@ -2519,7 +2519,16 @@ do_vpn_bypass() {
             uci set firewall.xe3000_inc.path="$BASE/firewall.sh"
             uci set firewall.xe3000_inc.reload=1
             uci commit firewall
-            sh "$BASE/firewall.sh" || die "تعذر تطبيق قواعد التجاوز"
+            # في on: طبّق فورًا وسجّل القرار. في auto: لا تغيّر المسار قبل القياس —
+            # الفتح والإغلاق العشوائي يُسقط النفق بدل أن يجرّبه.
+            if [ "$_mode" = on ]; then
+                printf '1\n' >"$STATE/vpn-bypass.applied" 2>/dev/null
+                sh "$BASE/firewall.sh" || die "تعذر تطبيق قواعد التجاوز"
+            else
+                [ "$(fw_bypass_count)" = 0 ] &&
+                    printf '0\n' >"$STATE/vpn-bypass.applied" 2>/dev/null ||
+                    printf '1\n' >"$STATE/vpn-bypass.applied" 2>/dev/null
+            fi
 
             # في الوضع التلقائي تُعاد المراجعة دوريًا: النفق قد يسقط أو يعود
             mkdir -p /etc/crontabs; touch "$_cron"
@@ -2556,7 +2565,9 @@ do_vpn_bypass() {
                 fi
                 ok "الوضع التلقائي مفعّل — الـ VPN هو المفضّل، ويُراجَع كل ${2:-5} دقائق"
                 say "يتجاوز الـ VPN فقط إن لم يقم النفق عبره، ويعود لتجربته كل نصف ساعة."
-                say "القرار الأول جارٍ الآن — يقيسه من وصلات cloudflared النشطة."
+                say "القرار الأول جارٍ الآن: يجرّب الـ VPN ويقيس وصلات cloudflared."
+                say "قد ينقطع النفق دقيقة أثناء التجربة، ثم يستقرّ على ما نجح."
+                say "راجع بعد دقيقتين: sh $SELF vpn-bypass status"
                 sh "$BASE/firewall.sh" probe >/dev/null 2>&1 &
             fi
             say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
