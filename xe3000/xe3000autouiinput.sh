@@ -660,6 +660,11 @@ INITXRAY
     printf '#!/bin/sh\n'
     printf 'MET="127.0.0.1:%s"\n' "${CFD_METRICS:-20241}"
     cat <<'RUNCFD'
+# نفس علّة xray: Go 1.24+ يفتح المستمعين بـ MPTCP، وMPTCP في هذه النواة لا
+# تكتمل معه المصافحة. وصلات cloudflared الصادرة سليمة، لكن مستمع /ready
+# يبقى مفتوحًا بلا أن يقبل اتصالًا — فيُظهر netstat LISTEN وcurl مهلة.
+GODEBUG=multipathtcp=0
+export GODEBUG
 _i=0
 while [ "$_i" -lt 90 ]; do
     nslookup region1.v2.argotunnel.com >/dev/null 2>&1 && break
@@ -686,6 +691,7 @@ start_service() {
     [ -x /etc/xe3000-cf-fulltunnel/run-cloudflared.sh ] || return 1
     procd_open_instance
     procd_set_param command /etc/xe3000-cf-fulltunnel/run-cloudflared.sh
+    procd_set_param env GODEBUG=multipathtcp=0
     # retry=0 يعني بلا حدّ لعدد المحاولات في procd
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
