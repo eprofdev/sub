@@ -2505,9 +2505,21 @@ do_vpn_bypass() {
                 ok "تجاوز دائم: مرور الراوتر نحو 53 و80 و443 و7844 يخرج مباشرة ($_have/$_all)"
                 warn "دائم يعني أن النفق لن يسلك الـ VPN حتى وهو يعمل. للسلوك المفضّل: vpn-bypass auto"
             else
+                # بلا مقياس لا قرار: تأكّد أن /ready يجيب قبل إعلان أي شيء
+                if ! cfd_ready_ok; then
+                    say "منفذ المقاييس غير مهيّأ في إعداد cloudflared — أضيفه الآن."
+                    write_cfd_config
+                    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
+                    _w=0; while [ "$_w" -lt 10 ] && ! cfd_ready_ok; do sleep 3; _w=$((_w+1)); done
+                fi
+                if ! cfd_ready_ok; then
+                    add_bypass_now
+                    die "تعذّر قراءة /ready من cloudflared — لا يمكن للوضع التلقائي أن يقرّر.
+    أبقيتُ التجاوز مفعّلًا حتى لا يسقط النفق. راجع: logread -e cloudflared | tail -20"
+                fi
                 ok "الوضع التلقائي مفعّل — الـ VPN هو المفضّل، ويُراجَع كل ${2:-5} دقائق"
                 say "يتجاوز الـ VPN فقط إن لم يقم النفق عبره، ويعود لتجربته كل نصف ساعة."
-                say "قد يستغرق القرار الأول دقيقة — يقيسه من وصلات cloudflared النشطة."
+                say "القرار الأول جارٍ الآن — يقيسه من وصلات cloudflared النشطة."
                 sh "$BASE/firewall.sh" probe >/dev/null 2>&1 &
             fi
             say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
@@ -2536,6 +2548,20 @@ do_vpn_bypass() {
                 say "المراجعة : مجدولة في cron" || say "المراجعة : غير مجدولة" ;;
         *) die "الاستعمال: vpn-bypass auto|on|off|status" ;;
     esac
+}
+
+# هل يجيب منفذ مقاييس cloudflared؟ هو مصدر القرار الوحيد في الوضع التلقائي.
+cfd_ready_ok() {
+    curl -s --max-time 4 "http://127.0.0.1:${CFD_METRICS:-20241}/ready" 2>/dev/null |
+        grep -q readyConnections
+}
+
+# شبكة أمان: لا تترك النفق على مسار غير مثبت إن فشل الإعداد التلقائي
+add_bypass_now() {
+    write_fwinclude 2>/dev/null
+    printf 'on\n' >"$BYPASS_MODE" 2>/dev/null
+    sh "$BASE/firewall.sh" >/dev/null 2>&1
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
 }
 
 # نفس منطق الملف المولَّد، للعرض في الطرفية
@@ -2636,7 +2662,8 @@ case "${1:-}" in
     remove)             do_remove ;;
     prepare-runtime)    need_root; prepare_runtime ;;
     reinstall-services) need_root; load_settings || die "لا يوجد تثبيت محلي."
-                        write_init; enable_services ;;
+                        # الإعداد أيضًا: ملفا الخدمة وحدهما لا يحملان تغييرات config.yml
+                        write_cfd_config; write_xray_config; write_init; enable_services ;;
     version)            say "$VERSION" ;;
     help|-h|--help)     usage ;;
     *)                  err "أمر غير معروف: $1"; usage; exit 1 ;;
