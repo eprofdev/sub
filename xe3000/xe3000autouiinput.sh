@@ -1275,7 +1275,11 @@ set_password() { # $1 = enabled flag
     _enabled=${1:-1}
     if [ "$_enabled" = 0 ]; then
         rm -f "$UIROOT/httpd.conf"
-        warn "المصادقة معطّلة بطلبك (auth.enabled=0) — اللوحة بلا كلمة مرور."
+        # الملف وحده لا يكفي: الخيار في uci يظل يشير إليه فيطلب uhttpd مصادقة
+        uci -q delete uhttpd.xe3000.config 2>/dev/null
+        uci commit uhttpd 2>/dev/null
+        say "اللوحة تُفتح بلا اسم مستخدم ولا كلمة مرور (شبكة LAN فقط)."
+        say "لتفعيل الحماية لاحقًا: sh $SELF auth on"
         return 0
     fi
     _user=${FULLTUNNEL_UI_USER:-admin}
@@ -1306,6 +1310,27 @@ set_password() { # $1 = enabled flag
     printf '/:%s:%s\n' "$_user" "$(openssl passwd -1 "$_pass")" >"$UIROOT/httpd.conf"
     chmod 600 "$UIROOT/httpd.conf"
     ok "ضُبطت كلمة مرور اللوحة للمستخدم $_user"
+}
+
+# حماية اللوحة: معطّلة افتراضيًا، وتُفعَّل باسم وكلمة مرور عند الطلب فقط
+do_auth() {
+    need_root
+    case "${1:-status}" in
+        off|0)
+            set_password 0
+            /etc/init.d/uhttpd restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل uhttpd"
+            ok "الحماية معطّلة — اللوحة تُفتح مباشرة من شبكة LAN" ;;
+        on|1)
+            set_password 1
+            configure_uhttpd ;;
+        status)
+            if [ -s "$UIROOT/httpd.conf" ]; then
+                say "الحماية: مفعّلة (المستخدم: $(cut -d: -f2 "$UIROOT/httpd.conf"))"
+            else
+                say "الحماية: معطّلة — اللوحة بلا اسم مستخدم ولا كلمة مرور"
+            fi ;;
+        *) die "الاستعمال: auth on|off|status" ;;
+    esac
 }
 
 # مُثبّتات سابقة تركت نسخة uhttpd تحجز المنفذ، فيفشل ارتباط لوحتنا صامتًا
@@ -1355,7 +1380,11 @@ configure_uhttpd() {
     uci set uhttpd.xe3000.cgi_prefix=/cgi-bin
     uci set uhttpd.xe3000.rfc1918_filter=1
     uci add_list uhttpd.xe3000.index_page=index.html
-    [ -f "$UIROOT/httpd.conf" ] && uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
+    if [ -s "$UIROOT/httpd.conf" ]; then
+        uci set uhttpd.xe3000.config="$UIROOT/httpd.conf"
+    else
+        uci -q delete uhttpd.xe3000.config
+    fi
     uci commit uhttpd
 
     # فتح المنفذ على شبكة LAN فقط — بعض صور GL.iNet ترفض المدخلات غير المصرّح بها
@@ -1386,7 +1415,7 @@ configure_uhttpd() {
 
 install_ui() {
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
     configure_uhttpd
 }
 
@@ -1581,7 +1610,7 @@ do_repair_ui() {
 do_bootstrap() {
     need_root
     write_ui_files
-    set_password "${FULLTUNNEL_AUTH_ENABLED:-1}"
+    set_password "${FULLTUNNEL_AUTH_ENABLED:-0}"
     configure_uhttpd
     ok "افتح https://$(lan_ip):$UI_PORT_S/cgi-bin/setup.cgi وأدخل بيانات Cloudflare."
 }
@@ -1653,7 +1682,7 @@ do_menu() {
         say "  1) الحالة            2) المستخدمون"
         say "  3) الروابط           4) تشغيل/إيقاف/إعادة"
         say "  5) تشخيص             6) تبديل التوكن"
-        say "  7) كلمة مرور اللوحة  8) لوحة 9000"
+        say "  7) حماية اللوحة      8) لوحة 9000"
         say "  9) تثبيت/إكمال       0) خروج"
         read_tty "الاختيار: " _c
         case "$_c" in
@@ -1663,7 +1692,13 @@ do_menu() {
             4) menu_services ;;
             5) do_diagnose; say ""; do_selftest || true ;;
             6) do_set_token || true ;;
-            7) need_root; set_password 1 && configure_uhttpd ;;
+            7) say "  1) بلا اسم مستخدم وكلمة مرور   2) تفعيل الحماية"
+               read_tty "الاختيار: " _a
+               case "$_a" in
+                   1) do_auth off ;;
+                   2) do_auth on ;;
+                   *) : ;;
+               esac ;;
             8) say "https://$(lan_ip):$UI_PORT_S/cgi-bin/control.cgi  (أو http://$(lan_ip):$UI_PORT/)" ;;
             9) do_auto_self || true ;;
             0|q|Q) return 0 ;;
@@ -2227,6 +2262,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF status           حالة البوابة والواجهة
   sh $SELF diagnose         فحص uhttpd والمنفذ $UI_PORT
   sh $SELF repair-ui        إصلاح ربط HTTPS على LAN
+  sh $SELF auth on|off|status  حماية اللوحة (معطّلة افتراضيًا)
   sh $SELF set-password     كلمة مرور اللوحة
   sh $SELF set-token        تبديل توكن Cloudflare وحده ثم فحصه
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
@@ -2264,6 +2300,7 @@ case "${1:-}" in
     status)             do_status ;;
     diagnose)           do_diagnose ;;
     repair-ui)          do_repair_ui ;;
+    auth)               do_auth "${2:-status}" ;;
     set-password)       need_root; set_password 1; configure_uhttpd ;;
     set-token)          do_set_token ;;
     selftest)           do_selftest ;;
