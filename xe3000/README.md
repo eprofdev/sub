@@ -301,6 +301,33 @@ sh /root/xe3000autouiinput.sh vpn-bypass auto 5      # المراجعة كل 5 �
 `include` الجدار الناري عند الإقلاع، ومن `cron` كل دقيقتين بعد ذلك، وكل تبديل
 يُسجَّل في `logread -e xe3000`.
 
+### حافة Cloudflare تقطع المصافحة على 7844
+
+`logread -e cloudflared` يُظهر:
+
+```
+TLS handshake with edge error: read tcp 172.19.0.1:57792->198.41.192.47:7844:
+read: connection reset by peer
+```
+
+الحزم تصل إلى الحافة ثم يقطعها شيء في الطريق — ليست مهلة ولا خطأ توجيه. عنوان
+المصدر يقول أي مسار سلكته: عنوان النفق (مثل `172.19.0.1`) يعني عبر الـ VPN،
+وعنوان الواجهة الخارجية يعني مباشرة.
+
+جرّب المسار الآخر أولًا: `vpn-bypass on` يُخرج 7844 مباشرة، و`off` يعيده إلى
+الـ VPN. فإن قُطع في الحالتين فبدّل بروتوكول الوصلة — بعض الشبكات تقطع
+7844/TCP وتمرّر 7844/UDP أو العكس:
+
+```sh
+sh /root/xe3000autouiinput.sh set-edge-protocol quic     # UDP 7844
+sh /root/xe3000autouiinput.sh set-edge-protocol http2    # TCP 7844 (الافتراضي)
+sh /root/xe3000autouiinput.sh set-edge-protocol auto     # اترك الاختيار لـ cloudflared
+sleep 20; logread -e cloudflared | tail -12
+```
+
+`Registered tunnel connection` تعني أن الوصلة قامت. القيمة تُحفظ في
+`settings.env` ولا تمسّ النفق ولا المسار ولا المستخدمين.
+
 | الوضع | متى |
 |---|---|
 | `auto` | الافتراضي — تجاوز عند سقوط النفق فقط |

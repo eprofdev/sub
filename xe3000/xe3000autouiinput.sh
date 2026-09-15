@@ -26,7 +26,7 @@ esac
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
 XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
-XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=
+XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -466,7 +466,7 @@ write_cfd_config() {
     cat >"$CFD_DIR/config.yml" <<CFDCFG
 tunnel: $TUNNEL_ID
 credentials-file: $BASE/tunnel/$TUNNEL_ID.json
-protocol: http2
+protocol: ${CFD_PROTO:-http2}
 no-autoupdate: true
 loglevel: info
 ingress:
@@ -663,6 +663,7 @@ FULLTUNNEL_PROTO=${XRAY_PROTO:-vless}
 FULLTUNNEL_SSHWS=${SSHWS:-0}
 FULLTUNNEL_SSH_PATH=${SSH_PATH:-/ssh}
 FULLTUNNEL_SSH_PORT=${SSH_PORT:-0}
+FULLTUNNEL_CFD_PROTO=${CFD_PROTO:-http2}
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -685,6 +686,7 @@ load_settings() {
     SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh}
     SSH_PORT=${FULLTUNNEL_SSH_PORT:-0}
     [ "$SSH_PORT" = 0 ] && SSH_PORT=$(( ${XRAY_PORT:-18443} + 1 ))
+    CFD_PROTO=${FULLTUNNEL_CFD_PROTO:-http2}
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
@@ -2348,6 +2350,26 @@ fw_bypass_count() {
 
 fw_bypass_total() { set -- $FW_BYPASS_PORTS; printf '%s' "$#"; }
 
+# بعض الشبكات تقطع مصافحة TLS إلى حافة Cloudflare على 7844/TCP بينما تمرّر
+# 7844/UDP (quic) أو العكس. هذا يبدّل الاثنين بلا مساس بأي إعداد آخر.
+do_set_edge_proto() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    case "${1:-}" in
+        http2|quic|auto) CFD_PROTO=$1 ;;
+        '') say "بروتوكول الحافة الآن: ${CFD_PROTO:-http2}"
+            say "الاستعمال: set-edge-protocol http2|quic|auto"
+            return 0 ;;
+        *) die "الاستعمال: set-edge-protocol http2|quic|auto  (http2=TCP 7844، quic=UDP 7844)" ;;
+    esac
+    save_settings
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "بروتوكول الحافة الآن: $CFD_PROTO"
+    say "انتظر نحو 20 ثانية ثم: logread -e cloudflared | tail -12"
+    say "ابحث عن Registered tunnel connection — ظهورها يعني أن الوصلة قامت."
+}
+
 do_vpn_bypass() {
     need_root
     _cron=/etc/crontabs/root
@@ -2451,6 +2473,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-protocol <vless|trojan>  تبديل البروتوكول
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
+  sh $SELF set-edge-protocol <http2|quic|auto>  بروتوكول وصلة الحافة
   sh $SELF vpn-bypass auto|on|off|status  تجاوز سياسة VPN عند سقوط النفق فقط
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
@@ -2490,6 +2513,7 @@ case "${1:-}" in
     set-protocol)       do_set_protocol "${2:-}" ;;
     ssh-ws)             do_sshws "${2:-}" ;;
     watchdog)           do_watchdog "${2:-}" "${3:-}" ;;
+    set-edge-protocol)  do_set_edge_proto "${2:-}" ;;
     vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
