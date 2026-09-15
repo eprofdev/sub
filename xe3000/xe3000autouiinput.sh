@@ -26,7 +26,7 @@ esac
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
 XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
-XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=
+XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=; CFD_EDGE_IP=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -467,6 +467,10 @@ write_cfd_config() {
 tunnel: $TUNNEL_ID
 credentials-file: $BASE/tunnel/$TUNNEL_ID.json
 protocol: ${CFD_PROTO:-http2}
+# تجاوز سياسة الـ VPN يعمل على IPv4 فقط (iptables لا ip6tables)، فمرور IPv6
+# يبقى يسلك السياسة المكسورة: cloudflared يجرّب عناوين حافة IPv6 فيحصل على
+# "network is unreachable" ويضيّع دورات قبل أن يصادف عنوان IPv4.
+edge-ip-version: ${CFD_EDGE_IP:-4}
 no-autoupdate: true
 loglevel: info
 ingress:
@@ -684,6 +688,7 @@ FULLTUNNEL_SSHWS=${SSHWS:-0}
 FULLTUNNEL_SSH_PATH=${SSH_PATH:-/ssh}
 FULLTUNNEL_SSH_PORT=${SSH_PORT:-0}
 FULLTUNNEL_CFD_PROTO=${CFD_PROTO:-http2}
+FULLTUNNEL_CFD_EDGE_IP=${CFD_EDGE_IP:-4}
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -707,6 +712,7 @@ load_settings() {
     SSH_PORT=${FULLTUNNEL_SSH_PORT:-0}
     [ "$SSH_PORT" = 0 ] && SSH_PORT=$(( ${XRAY_PORT:-18443} + 1 ))
     CFD_PROTO=${FULLTUNNEL_CFD_PROTO:-http2}
+    CFD_EDGE_IP=${FULLTUNNEL_CFD_EDGE_IP:-4}
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
