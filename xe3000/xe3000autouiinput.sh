@@ -720,6 +720,9 @@ disable_tfo() {
     return 0
 }
 
+# تشغيلها الآن لا يعني أنها تبدأ بعد الإقلاع: ذلك رابط منفصل في /etc/rc.d
+svc_boot_enabled() { ls /etc/rc.d/S[0-9][0-9]"$1" >/dev/null 2>&1; }
+
 enable_services() {
     disable_tfo
     for s in xe3000-cf-xray xe3000-cf-tunnel; do
@@ -732,6 +735,13 @@ enable_services() {
             ok "$s يعمل"
         else
             warn "$s لا يعمل — راجع logread -e $s"
+        fi
+        # الفشل هنا صامت تمامًا حتى أول إقلاع، فتحقّق منه الآن
+        if svc_boot_enabled "$s"; then
+            ok "$s سيبدأ تلقائيًا بعد الإقلاع"
+        else
+            warn "$s لن يبدأ بعد الإقلاع — لا رابط في /etc/rc.d"
+            say "  جرّب: /etc/init.d/$s enable && ls -l /etc/rc.d/ | grep $s"
         fi
     done
 }
@@ -1824,9 +1834,14 @@ do_selftest() {
     say "── 1) الخدمتان ──"
     for _s in xe3000-cf-xray xe3000-cf-tunnel; do
         if [ -x /etc/init.d/$_s ] && /etc/init.d/$_s running >/dev/null 2>&1; then
-            ok "$_s يعمل"
+            svc_boot_enabled "$_s" && ok "$_s يعمل" ||
+                { ok "$_s يعمل"; warn "  لكنه لن يبدأ بعد الإقلاع: /etc/init.d/$_s enable"; }
         else
             err "$_s متوقف"; _fail=1
+            if [ -x /etc/init.d/$_s ] && ! svc_boot_enabled "$_s"; then
+                say "    ولا رابط إقلاع في /etc/rc.d — لهذا لم يبدأ وحده:"
+                say "      /etc/init.d/$_s enable && /etc/init.d/$_s start"
+            fi
         fi
     done
 
