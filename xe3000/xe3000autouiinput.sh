@@ -1938,10 +1938,24 @@ do_selftest() {
         say "    path في config.json : $_cw"
         say "    path في settings.env: $XRAY_WSPATH"
         case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
-        [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF user-list && sh $SELF user-add tmp"; _fail=1; }
+        [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF users-apply"; _fail=1; }
         is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
     else
         err "$_cfg مفقود أو فارغ."; _fail=1
+    fi
+
+    # links يطبع من users.tsv بينما xray يعمل بـ config.json. تفاوتهما يُظهر
+    # رابطًا يبدو سليمًا ويرفضه الخادم بـ "invalid request user id".
+    if [ -f "$XRAY_DIR/config.json" ] && [ -s "$USERS" ]; then
+        _uids=$(awk -F'\t' 'NF{print $1}' "$USERS" | sort | tr '\n' ' ')
+        _cids=$(sed -n 's/.*"id": "\([^"]*\)".*/\1/p' "$XRAY_DIR/config.json" | sort | tr '\n' ' ')
+        if [ "$_uids" = "$_cids" ]; then
+            ok "قائمة المستخدمين ومعرّفات xray متطابقة ($(users_count))"
+        else
+            err "معرّفات xray لا تطابق قائمة المستخدمين — الروابط ستُرفض."; _fail=1
+            say "    xray سيردّ: invalid request user id"
+            say "    أصلحه بـ: sh $SELF users-apply"
+        fi
     fi
 
     say ""
@@ -2658,6 +2672,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
+  sh $SELF users-apply      إعادة بناء إعداد xray من قائمة المستخدمين
   sh $SELF user-add [اسم]   إضافة مستخدم وتطبيقه
   sh $SELF user-del <اسم>   حذف مستخدم وتطبيقه
   sh $SELF links            طباعة روابط الاشتراك الكاملة
@@ -2697,6 +2712,7 @@ case "${1:-}" in
     vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
+    users-apply)        need_root; users_apply ;;
     user-add)           need_root; user_add "${2:-}" >/dev/null && users_apply ;;
     user-del)           need_root
                         [ "$(users_count)" -gt 1 ] || die "لا يمكن حذف آخر مستخدم."
