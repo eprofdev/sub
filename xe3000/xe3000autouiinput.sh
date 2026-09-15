@@ -609,6 +609,7 @@ write_configs() {
 }
 
 write_init() {
+    mkdir -p /etc/xe3000-cf-fulltunnel
     cat >/etc/init.d/xe3000-cf-xray <<'INITXRAY'
 #!/bin/sh /etc/rc.common
 START=94
@@ -628,6 +629,24 @@ start_service() {
 }
 INITXRAY
 
+    # cloudflared يترجم سجل SRV قبل أي شيء ويخرج إن فشل. عند الإقلاع لا يكون
+    # DNS جاهزًا بعد، فتموت الخدمة بينما xray يبدأ بلا مشكلة لأنه لا يحتاج شبكة.
+    # هذا الغلاف ينتظر الترجمة ثم يستبدل نفسه بـ cloudflared.
+    cat >/etc/xe3000-cf-fulltunnel/run-cloudflared.sh <<'RUNCFD'
+#!/bin/sh
+_i=0
+while [ "$_i" -lt 90 ]; do
+    nslookup region1.v2.argotunnel.com >/dev/null 2>&1 && break
+    _i=$((_i + 1))
+    [ "$_i" = 1 ] && logger -t xe3000 "cloudflared: بانتظار جهوزية DNS قبل البدء"
+    sleep 2
+done
+[ "$_i" -lt 90 ] || logger -t xe3000 "cloudflared: DNS لم يجهز خلال 3 دقائق — سأبدأ رغم ذلك"
+exec /usr/bin/cloudflared --no-autoupdate \
+    --config /etc/xe3000-cf-fulltunnel/cloudflared/config.yml tunnel run
+RUNCFD
+    chmod 750 /etc/xe3000-cf-fulltunnel/run-cloudflared.sh
+
     cat >/etc/init.d/xe3000-cf-tunnel <<'INITCFD'
 #!/bin/sh /etc/rc.common
 START=95
@@ -635,9 +654,10 @@ STOP=10
 USE_PROCD=1
 start_service() {
     [ -f /etc/xe3000-cf-fulltunnel/cloudflared/config.yml ] || return 1
+    [ -x /etc/xe3000-cf-fulltunnel/run-cloudflared.sh ] || return 1
     procd_open_instance
-    procd_set_param command /usr/bin/cloudflared --no-autoupdate \
-        --config /etc/xe3000-cf-fulltunnel/cloudflared/config.yml tunnel run
+    procd_set_param command /etc/xe3000-cf-fulltunnel/run-cloudflared.sh
+    # retry=0 يعني بلا حدّ لعدد المحاولات في procd
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
     procd_set_param stderr 1
