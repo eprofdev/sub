@@ -26,7 +26,7 @@ esac
 CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
 XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
-XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=; CFD_EDGE_IP=
+XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=; CFD_EDGE_IP=; CFD_METRICS=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -471,6 +471,8 @@ protocol: ${CFD_PROTO:-http2}
 # يبقى يسلك السياسة المكسورة: cloudflared يجرّب عناوين حافة IPv6 فيحصل على
 # "network is unreachable" ويضيّع دورات قبل أن يصادف عنوان IPv4.
 edge-ip-version: ${CFD_EDGE_IP:-4}
+# /ready يعيد عدد الوصلات النشطة — هو الحكم على نجاح المسار الحالي
+metrics: 127.0.0.1:${CFD_METRICS:-20241}
 no-autoupdate: true
 loglevel: info
 ingress:
@@ -689,6 +691,7 @@ FULLTUNNEL_SSH_PATH=${SSH_PATH:-/ssh}
 FULLTUNNEL_SSH_PORT=${SSH_PORT:-0}
 FULLTUNNEL_CFD_PROTO=${CFD_PROTO:-http2}
 FULLTUNNEL_CFD_EDGE_IP=${CFD_EDGE_IP:-4}
+FULLTUNNEL_CFD_METRICS=${CFD_METRICS:-20241}
 FULLTUNNEL_XRAY_UUID=$XRAY_UUID
 FULLTUNNEL_XRAY_PATH=$XRAY_WSPATH
 FULLTUNNEL_INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -713,6 +716,7 @@ load_settings() {
     [ "$SSH_PORT" = 0 ] && SSH_PORT=$(( ${XRAY_PORT:-18443} + 1 ))
     CFD_PROTO=${FULLTUNNEL_CFD_PROTO:-http2}
     CFD_EDGE_IP=${FULLTUNNEL_CFD_EDGE_IP:-4}
+    CFD_METRICS=${FULLTUNNEL_CFD_METRICS:-20241}
     XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-}
     XRAY_WSPATH=${FULLTUNNEL_XRAY_PATH:-}
     return 0
@@ -2300,20 +2304,28 @@ write_fwinclude() {
     cat <<'FWIHEAD'
 #!/bin/sh
 # سياسة VPN في GL.iNet (rtp2.sh) تدفع كل ما ينشئه الراوتر إلى جدول سياسة
-# مساره الافتراضي عبر نفق VPN. هذا هو المطلوب ما دام النفق يعمل: النفق العام
-# لا يصل إلى Cloudflare إلا عبره. لكن إن سقط النفق ضاعت الحزم أو ابتلعتها
-# قاعدة blackhole، فيظهر ذلك كـ "Operation not permitted" أو مهلة.
+# مساره الافتراضي عبر نفق VPN. هذا هو المطلوب: النفق العام يمرّ عبر الـ VPN.
 #
-# لذلك: العلامة 0x8000 (تلتقطها قاعدة ip rule ذات الأولوية 6000 فتذهب الحزمة
-# إلى الجدول main مباشرة) تُوضع فقط حين يكون مسار الـ VPN ساقطًا، وتُرفع فور
-# عودته. الوضع في state/vpn-bypass.mode: auto (الافتراضي) أو on أو off.
+# لكن حياة الـ VPN لا تكفي حكمًا: قد يكون النفق حيًّا ويردّ على ping بينما
+# يقطع مصافحة TLS مع حافة Cloudflare على 7844 ("connection reset"). لذلك
+# الحكم هنا على ما يهم فعلًا: عدد وصلات cloudflared النشطة من /ready.
+#
+#   auto  = فضّل الـ VPN. تجاوزه فقط إن سقط النفق عبره، وعُد لتجربته دوريًا.
+#   on    = تجاوز دائم.    off = بلا تجاوز إطلاقًا.
+#
+# العلامة 0x8000 تلتقطها قاعدة ip rule ذات الأولوية 6000 فتذهب الحزمة إلى
+# الجدول main مباشرة عبر منفذ الإنترنت.
 #
 # mangle/OUTPUT لا يرى إلا ما ينشئه الراوتر: مرور أجهزة الشبكة يمرّ بـ FORWARD،
 # فكِل‑سويتش أجهزتك لا يتأثر بهذا الملف إطلاقًا.
 FWIHEAD
     printf 'PORTS="%s"\n' "$FW_BYPASS_PORTS"
     printf 'MODEF="%s"\n' "$BYPASS_MODE"
+    printf 'STAMP="%s"\n' "$STATE/vpn-bypass.lastretry"
+    printf 'APPLIED="%s"\n' "$STATE/vpn-bypass.applied"
+    printf 'METRICS="127.0.0.1:%s"\n' "${CFD_METRICS:-20241}"
     printf 'TUNSVC="%s"\n' "/etc/init.d/xe3000-cf-tunnel"
+    printf 'RETRY_AFTER=%s\n' "${BYPASS_RETRY:-1800}"
     cat <<'FWIBODY'
 
 _rule() { # $1=عملية $2=بروتوكول $3=منفذ
@@ -2327,34 +2339,30 @@ count_rules() {
     for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" && _n=$((_n+1)); done
     echo "$_n"
 }
-total_rules() { set -- $PORTS; echo $#; }
 
-# المسار الافتراضي داخل جداول السياسة: "بوابة جهاز"
-vpn_route() {
-    for _t in $(ip rule 2>/dev/null | sed -n 's/.*lookup \([0-9][0-9]*\).*/\1/p' | sort -un); do
-        ip route show table "$_t" 2>/dev/null | awk '/^default via /{print $3" "$5; exit}'
-    done | grep -E ' (tun|wg|ppp|ovpn|vti)' | head -1
-}
-
-# up = النفق حيّ فمرّر عبره، down = ساقط فتجاوزه، none = لا نفق أصلًا
-vpn_state() {
-    _r=$(vpn_route)
-    [ -n "$_r" ] || { echo none; return; }
-    _gw=${_r%% *}; _dev=${_r##* }
-    ip link show "$_dev" >/dev/null 2>&1 || { echo down; return; }
-    case "$_dev" in
-        wg*)
-            _h=$(wg show "$_dev" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
-            if [ -n "$_h" ] && [ "$_h" -gt 0 ] && [ $(( $(date +%s) - _h )) -lt 240 ]; then
-                echo up
-            else
-                echo down
-            fi ;;
-        *)  ping -c1 -W2 "$_gw" >/dev/null 2>&1 && echo up || echo down ;;
+# عدد وصلات cloudflared النشطة الآن: -1 يعني تعذّرت القراءة
+ready_conns() {
+    _j=$(curl -s --max-time 4 "http://$METRICS/ready" 2>/dev/null)
+    case "$_j" in
+        *readyConnections*)
+            echo "$_j" | sed -n 's/.*"readyConnections":[ ]*\([0-9]*\).*/\1/p' | head -1 ;;
+        *) echo -1 ;;
     esac
 }
 
-kill_switch() { ip rule 2>/dev/null | grep -q blackhole; }
+tun_running() { [ -x "$TUNSVC" ] && "$TUNSVC" running >/dev/null 2>&1; }
+
+# انتظر حتى تستقر الوصلات بعد إعادة التشغيل
+wait_ready() {
+    _w=0
+    while [ "$_w" -lt 12 ]; do
+        sleep 5; _w=$((_w+1))
+        [ "$(ready_conns)" -ge 1 ] 2>/dev/null && return 0
+    done
+    return 1
+}
+
+restart_tun() { [ -x "$TUNSVC" ] && "$TUNSVC" restart >/dev/null 2>&1; }
 
 MODE=$(cat "$MODEF" 2>/dev/null)
 [ -n "$MODE" ] || MODE=auto
@@ -2363,28 +2371,60 @@ case "$MODE" in
     off) del_rules; exit 0 ;;
 esac
 
-_st=$(vpn_state)
-case "$_st" in
-    up)   _want=0 ;;
-    down) _want=1 ;;
-    *)    kill_switch && _want=1 || _want=0 ;;
-esac
-
-_now=$(count_rules); _all=$(total_rules); _changed=0
-if [ "$_want" = 1 ]; then
-    [ "$_now" = "$_all" ] || {
-        add_rules; _changed=1
-        logger -t xe3000 "vpn-bypass: مسار VPN ($_st) — فُعّل التجاوز المباشر"
-    }
-else
-    [ "$_now" = 0 ] || {
-        del_rules; _changed=1
-        logger -t xe3000 "vpn-bypass: مسار VPN ($_st) — رُفع التجاوز، المرور يسلك الـ VPN"
-    }
+# يُستدعى من مكانين: include الجدار الناري (بلا وسيط) وcron (بـ probe).
+# الأول يعمل داخل إعادة تحميل الجدار فيجب ألا ينتظر: يُعيد آخر قرار فورًا،
+# وهذا هو ما يُرجع قواعد DNS بعد الإقلاع قبل أن تبدأ الخدمة أصلًا.
+if [ "${1:-}" != probe ]; then
+    [ "$(cat "$APPLIED" 2>/dev/null)" = 1 ] && add_rules || del_rules
+    exit 0
 fi
 
-# تبديل المسار يقطع وصلة cloudflared القائمة: أعد تشغيلها لتتصل عبر المسار الجديد
-[ "$_changed" = 1 ] && [ -x "$TUNSVC" ] && "$TUNSVC" restart >/dev/null 2>&1
+# ── الفحص الدوري: الـ VPN هو المفضّل ──
+# قبل أن تبدأ الخدمة لا يوجد ما يُحكم عليه: اترك الحالة كما هي.
+tun_running || exit 0
+
+_marks=$(count_rules)
+_ready=$(ready_conns)
+[ "$_ready" -ge 0 ] 2>/dev/null || exit 0     # تعذّرت القراءة: لا تقرّر على غير بيّنة
+_now=$(date +%s)
+
+if [ "$_marks" = 0 ]; then
+    # على مسار الـ VPN — وهو المطلوب. لا تتحرّك إلا إن سقط النفق عبره.
+    [ "$_ready" -ge 1 ] && exit 0
+    logger -t xe3000 "vpn-bypass: النفق لا يقوم عبر الـ VPN — أتجاوزه مؤقتًا"
+    add_rules; echo 1 >"$APPLIED" 2>/dev/null; restart_tun
+    wait_ready && logger -t xe3000 "vpn-bypass: قام النفق مباشرةً" ||
+        logger -t xe3000 "vpn-bypass: لم يقم في الحالتين — راجع logread -e cloudflared"
+    echo "$_now" >"$STAMP" 2>/dev/null
+    exit 0
+fi
+
+# على المسار المباشر. النفق يعمل؟ جرّب العودة إلى الـ VPN بين حين وآخر.
+if [ "$_ready" -ge 1 ]; then
+    _last=$(cat "$STAMP" 2>/dev/null); [ -n "$_last" ] || _last=0
+    [ $((_now - _last)) -ge "$RETRY_AFTER" ] || exit 0
+    echo "$_now" >"$STAMP" 2>/dev/null
+    logger -t xe3000 "vpn-bypass: أجرّب إعادة المرور إلى الـ VPN"
+    del_rules; echo 0 >"$APPLIED" 2>/dev/null; restart_tun
+    if wait_ready; then
+        logger -t xe3000 "vpn-bypass: نجح — المرور يسلك الـ VPN الآن"
+    else
+        add_rules; echo 1 >"$APPLIED" 2>/dev/null; restart_tun
+        logger -t xe3000 "vpn-bypass: الـ VPN ما زال يقطع الوصلة — عدتُ إلى المباشر"
+    fi
+    exit 0
+fi
+
+# مباشر ولا يعمل أيضًا: جرّب الـ VPN، فربما عاد.
+logger -t xe3000 "vpn-bypass: النفق لا يقوم مباشرةً — أجرّب الـ VPN"
+del_rules; echo 0 >"$APPLIED" 2>/dev/null; restart_tun
+if wait_ready; then
+    logger -t xe3000 "vpn-bypass: قام عبر الـ VPN"
+else
+    add_rules; echo 1 >"$APPLIED" 2>/dev/null; restart_tun
+    logger -t xe3000 "vpn-bypass: لم يقم في الحالتين — راجع logread -e cloudflared"
+fi
+echo "$_now" >"$STAMP" 2>/dev/null
 exit 0
 FWIBODY
     } >"$BASE/firewall.sh" || die "تعذر كتابة $BASE/firewall.sh"
@@ -2453,24 +2493,22 @@ do_vpn_bypass() {
             mkdir -p /etc/crontabs; touch "$_cron"
             sed -i "\\#$BASE/firewall.sh#d" "$_cron"
             if [ "$_mode" = auto ]; then
-                printf '*/%s * * * * %s/firewall.sh\n' "${2:-2}" "$BASE" >>"$_cron"
+                printf '*/%s * * * * %s/firewall.sh probe\n' "${2:-5}" "$BASE" >>"$_cron"
                 /etc/init.d/cron enable  >/dev/null 2>&1
                 /etc/init.d/cron restart >/dev/null 2>&1
             fi
 
-            _have=$(fw_bypass_count); _all=$(fw_bypass_total); _st=$(vpn_link_state)
+            _have=$(fw_bypass_count); _all=$(fw_bypass_total)
             if [ "$_mode" = on ]; then
                 [ "$_have" = "$_all" ] ||
                     die "طُبّقت $_have من $_all قاعدة فقط — راجع: iptables -t mangle -L OUTPUT -n -v"
                 ok "تجاوز دائم: مرور الراوتر نحو 53 و80 و443 و7844 يخرج مباشرة ($_have/$_all)"
-                warn "دائم يعني أن النفق لن يسلك الـ VPN حتى وهو يعمل. للسلوك الذكي: vpn-bypass auto"
+                warn "دائم يعني أن النفق لن يسلك الـ VPN حتى وهو يعمل. للسلوك المفضّل: vpn-bypass auto"
             else
-                ok "الوضع التلقائي مفعّل — يُراجَع كل ${2:-2} دقيقة"
-                case "$_st" in
-                    up)   ok "مسار VPN يعمل — المرور يسلك الـ VPN، بلا تجاوز ($_have/$_all)" ;;
-                    down) ok "مسار VPN ساقط — التجاوز مفعّل مؤقتًا ($_have/$_all)، ويُرفع فور عودته" ;;
-                    *)    say "لا أرى نفق VPN في جداول السياسة — التجاوز $( [ "$_have" = 0 ] && echo معطّل || echo مفعّل )" ;;
-                esac
+                ok "الوضع التلقائي مفعّل — الـ VPN هو المفضّل، ويُراجَع كل ${2:-5} دقائق"
+                say "يتجاوز الـ VPN فقط إن لم يقم النفق عبره، ويعود لتجربته كل نصف ساعة."
+                say "قد يستغرق القرار الأول دقيقة — يقيسه من وصلات cloudflared النشطة."
+                sh "$BASE/firewall.sh" probe >/dev/null 2>&1 &
             fi
             say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
             say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز." ;;
@@ -2486,9 +2524,14 @@ do_vpn_bypass() {
             ok "أُلغي التجاوز — كل مرور الراوتر يسلك سياسة الـ VPN" ;;
         status)
             _m=$(cat "$BYPASS_MODE" 2>/dev/null); [ -n "$_m" ] || _m="(غير مضبوط)"
+            _rc=$(curl -s --max-time 4 "http://127.0.0.1:${CFD_METRICS:-20241}/ready" 2>/dev/null |
+                  sed -n 's/.*"readyConnections":[ ]*\([0-9]*\).*/\1/p' | head -1)
+            _have=$(fw_bypass_count)
             say "الوضع    : $_m"
+            say "المسار   : $([ "$_have" = 0 ] && echo 'عبر الـ VPN' || echo 'مباشر (تجاوز)')"
             say "مسار VPN : $(vpn_link_state)"
-            say "القواعد  : $(fw_bypass_count)/$(fw_bypass_total)"
+            say "الوصلات  : ${_rc:-غير متاح} نشطة لدى cloudflared"
+            say "القواعد  : $_have/$(fw_bypass_total)"
             grep -qF "$BASE/firewall.sh" "$_cron" 2>/dev/null &&
                 say "المراجعة : مجدولة في cron" || say "المراجعة : غير مجدولة" ;;
         *) die "الاستعمال: vpn-bypass auto|on|off|status" ;;
@@ -2537,7 +2580,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
   sh $SELF set-edge-protocol <http2|quic|auto>  بروتوكول وصلة الحافة
-  sh $SELF vpn-bypass auto|on|off|status  تجاوز سياسة VPN عند سقوط النفق فقط
+  sh $SELF vpn-bypass auto|on|off|status  الـ VPN مفضّل، والتجاوز عند فشله
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
   sh $SELF user-list        عرض المستخدمين
