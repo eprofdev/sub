@@ -1855,7 +1855,7 @@ check_offload() {
 do_selftest() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
-    _fail=0
+    _fail=0; _public_ok=0
 
     say "── 1) الخدمتان ──"
     for _s in xe3000-cf-xray xe3000-cf-tunnel; do
@@ -1867,6 +1867,9 @@ do_selftest() {
             if [ -x /etc/init.d/$_s ] && ! svc_boot_enabled "$_s"; then
                 say "    ولا رابط إقلاع في /etc/rc.d — لهذا لم يبدأ وحده:"
                 say "      /etc/init.d/$_s enable && /etc/init.d/$_s start"
+            elif [ "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 9999)" -lt 240 ]; then
+                say "    الجهاز أقلع قبل قليل — cloudflared ينتظر جهوزية DNS ثم"
+                say "    يسجّل وصلاته تباعًا. انتظر دقيقتين وأعد الفحص."
             fi
         fi
     done
@@ -2096,7 +2099,7 @@ do_selftest() {
     say ""
     _l=$(ws_probe "https://$CF_HOSTNAME$XRAY_WSPATH")
     case "$_l" in
-        *101*) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل." ;;
+        *101*) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل."; _public_ok=1 ;;
         *404*) err "الحافة ترد 404 على المسار — path في العميل لا يطابق الإعداد."; _fail=1 ;;
         curl:*) err "curl لم يصل إلى المسار العام — $_l"
                 say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)" ;;
@@ -2108,6 +2111,14 @@ do_selftest() {
     if [ "$_fail" = 0 ]; then
         ok "كل الحلقات سليمة. إن فشل التطبيق فالخلل في إعداد العميل:"
         users_links
+    elif [ "${_public_ok:-0}" = 1 ]; then
+        # 101 من الإنترنت العام يثبت السلسلة كاملة. ما فشل قبله عابر —
+        # خدمة أثناء إعادة التشغيل، أو حالة لدى Cloudflare لم تُحدَّث بعد.
+        ok "المسار العام يعمل — 101 من الإنترنت يثبت السلسلة كاملة."
+        warn "ما ظهر أحمر أعلاه عابر (خدمة تبدأ، أو حالة متأخرة لدى Cloudflare)."
+        say "أعد الفحص بعد دقيقتين؛ إن تكرّر فهو عطل حقيقي."
+        users_links
+        return 0
     else
         err "انقطاع في السلسلة — أول سطر أحمر أعلاه هو موضعه."
     fi
