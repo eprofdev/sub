@@ -2022,7 +2022,18 @@ do_selftest() {
             _st=$(jf "$_r" '@.result.status')
             case "$_st" in
                 healthy) ok "حالة النفق: healthy" ;;
-                degraded) warn "حالة النفق: degraded — بعض الاتصالات ساقطة" ;;
+                degraded)
+                    # الحالة لدى Cloudflare تتأخر وتحتسب موصّلات ماتت عند إعادة
+                    # التشغيل. عدّ الوصلات المسجّلة محليًا منذ آخر إقلاع أصدق.
+                    _rc=$(logread -e cloudflared 2>/dev/null |
+                          grep -c 'Registered tunnel connection')
+                    if [ "${_rc:-0}" -ge 4 ]; then
+                        ok "حالة النفق لدى Cloudflare: degraded، لكن $_rc وصلات مسجّلة محليًا"
+                        say "    الحالة لديهم تتأخر بعد إعادة التشغيل — الحلقة 6 هي الفصل."
+                    else
+                        warn "حالة النفق: degraded — وصلات مسجّلة محليًا: ${_rc:-0} من 4"
+                        say "    جرّب ناقلًا آخر للحافة: sh $SELF set-edge-protocol quic"
+                    fi ;;
                 down|inactive|'') err "حالة النفق: ${_st:-غير معروفة} — cloudflared لا يصل إلى الحافة."
                                   say "    logread | grep cloudflared | tail -30"; _fail=1 ;;
                 *) say "    حالة النفق: $_st" ;;
