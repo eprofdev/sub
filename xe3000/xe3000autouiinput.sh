@@ -2226,6 +2226,9 @@ do_watchdog() {
 FW_BYPASS_PORTS='tcp:7844 udp:7844 udp:53 tcp:53 tcp:443 tcp:80'
 
 write_fwinclude() {
+    # vpn-bypass يُشغَّل غالبًا قبل التثبيت أو بعد remove، فالمجلّد قد لا يوجد
+    mkdir -p "$BASE" || die "تعذر إنشاء $BASE"
+    chmod 700 "$BASE" 2>/dev/null
     {
     cat <<'FWIHEAD'
 #!/bin/sh
@@ -2246,9 +2249,23 @@ FWIHEAD
         -j MARK --set-xmark 0x8000/0xf000
 done
 FWIBODY
-    } >"$BASE/firewall.sh"
+    } >"$BASE/firewall.sh" || die "تعذر كتابة $BASE/firewall.sh"
+    [ -s "$BASE/firewall.sh" ] || die "$BASE/firewall.sh كُتب فارغًا"
     chmod 750 "$BASE/firewall.sh"
 }
+
+# عدد القواعد الموجودة فعلًا في mangle/OUTPUT
+fw_bypass_count() {
+    _n=0
+    for _e in $FW_BYPASS_PORTS; do
+        _pr=${_e%%:*}; _pt=${_e##*:}
+        iptables -w -t mangle -C OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
+            -j MARK --set-xmark 0x8000/0xf000 2>/dev/null && _n=$((_n+1))
+    done
+    printf '%s' "$_n"
+}
+
+fw_bypass_total() { printf '%s' "$FW_BYPASS_PORTS" | wc -w | tr -d ' '; }
 
 fw_bypass_del() {
     for _e in $FW_BYPASS_PORTS; do
@@ -2268,8 +2285,12 @@ do_vpn_bypass() {
             uci set firewall.xe3000_inc.path="$BASE/firewall.sh"
             uci set firewall.xe3000_inc.reload=1
             uci commit firewall
-            sh "$BASE/firewall.sh"
-            ok "مرور الراوتر نحو المنافذ 53 و80 و443 و7844 يتجاوز سياسة VPN"
+            sh "$BASE/firewall.sh" || die "تعذر تطبيق قواعد التجاوز"
+            # لا تُعلن النجاح من مخرجات السكربت: اقرأ الجدول نفسه.
+            _have=$(fw_bypass_count); _want=$(fw_bypass_total)
+            [ "$_have" = "$_want" ] ||
+                die "طُبّقت $_have من $_want قاعدة فقط — راجع: iptables -t mangle -L OUTPUT -n -v"
+            ok "مرور الراوتر نحو المنافذ 53 و80 و443 و7844 يتجاوز سياسة VPN ($_have/$_want)"
             say "مرور أجهزة شبكتك لا يتأثر — هذا يخص ما ينشئه الراوتر وحده."
             say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز."
             if nslookup api.cloudflare.com >/dev/null 2>&1; then
@@ -2281,6 +2302,8 @@ do_vpn_bypass() {
             uci -q delete firewall.xe3000_inc && uci commit firewall
             fw_bypass_del
             rm -f "$BASE/firewall.sh"
+            _left=$(fw_bypass_count)
+            [ "$_left" = 0 ] || warn "بقيت $_left قاعدة — راجع: iptables -t mangle -L OUTPUT -n -v"
             ok "أُلغي التجاوز" ;;
         *) die "الاستعمال: vpn-bypass on|off" ;;
     esac
