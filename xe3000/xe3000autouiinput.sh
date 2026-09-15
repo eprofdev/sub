@@ -463,16 +463,18 @@ write_cfd_config() {
     service: http://$XRAY_LISTEN:$SSH_PORT
 "
     fi
-    cat >"$CFD_DIR/config.yml" <<CFDCFG
+    # القيم النصّية بين علامتي اقتباس: YAML تقرأ 4 عددًا وcloudflared يتوقع نصًّا
+    # فيرفض الملف كله ويخرج قبل أن يفتح أي شيء.
+    cat >"$CFD_DIR/config.yml.new" <<CFDCFG
 tunnel: $TUNNEL_ID
 credentials-file: $BASE/tunnel/$TUNNEL_ID.json
-protocol: ${CFD_PROTO:-http2}
+protocol: "${CFD_PROTO:-http2}"
 # تجاوز سياسة الـ VPN يعمل على IPv4 فقط (iptables لا ip6tables)، فمرور IPv6
 # يبقى يسلك السياسة المكسورة: cloudflared يجرّب عناوين حافة IPv6 فيحصل على
 # "network is unreachable" ويضيّع دورات قبل أن يصادف عنوان IPv4.
-edge-ip-version: ${CFD_EDGE_IP:-4}
+edge-ip-version: "${CFD_EDGE_IP:-4}"
 # /ready يعيد عدد الوصلات النشطة — هو الحكم على نجاح المسار الحالي
-metrics: 127.0.0.1:${CFD_METRICS:-20241}
+metrics: "127.0.0.1:${CFD_METRICS:-20241}"
 no-autoupdate: true
 loglevel: info
 ingress:
@@ -480,6 +482,19 @@ $_sshrule  - hostname: $CF_HOSTNAME
     service: $(cfd_service)$_oreq
   - service: http_status:404
 CFDCFG
+    [ -s "$CFD_DIR/config.yml.new" ] || { rm -f "$CFD_DIR/config.yml.new"
+        die "فشلت كتابة إعداد cloudflared."; }
+    # لا تستبدل إعدادًا عاملًا بآخر لا يقبله cloudflared: تحقّق قبل النقل
+    # حالة الخروج أصدق من مطابقة نصّ قد يتغيّر بين الإصدارات
+    if have cloudflared; then
+        if ! _v=$(cloudflared --config "$CFD_DIR/config.yml.new" \
+                    tunnel ingress validate 2>&1); then
+            rm -f "$CFD_DIR/config.yml.new"
+            die "cloudflared رفض الإعداد الجديد — أُبقي القديم:
+    $(printf '%s' "$_v" | head -3)"
+        fi
+    fi
+    mv "$CFD_DIR/config.yml.new" "$CFD_DIR/config.yml" || die "تعذر تثبيت إعداد cloudflared."
     chmod 600 "$CFD_DIR/config.yml"
 }
 
