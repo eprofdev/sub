@@ -656,8 +656,10 @@ INITXRAY
     # cloudflared يترجم سجل SRV قبل أي شيء ويخرج إن فشل. عند الإقلاع لا يكون
     # DNS جاهزًا بعد، فتموت الخدمة بينما xray يبدأ بلا مشكلة لأنه لا يحتاج شبكة.
     # هذا الغلاف ينتظر الترجمة ثم يستبدل نفسه بـ cloudflared.
-    cat >/etc/xe3000-cf-fulltunnel/run-cloudflared.sh <<'RUNCFD'
-#!/bin/sh
+    {
+    printf '#!/bin/sh\n'
+    printf 'MET="127.0.0.1:%s"\n' "${CFD_METRICS:-20241}"
+    cat <<'RUNCFD'
 _i=0
 while [ "$_i" -lt 90 ]; do
     nslookup region1.v2.argotunnel.com >/dev/null 2>&1 && break
@@ -666,9 +668,12 @@ while [ "$_i" -lt 90 ]; do
     sleep 2
 done
 [ "$_i" -lt 90 ] || logger -t xe3000 "cloudflared: DNS لم يجهز خلال 3 دقائق — سأبدأ رغم ذلك"
-exec /usr/bin/cloudflared --no-autoupdate \
+# --metrics صراحةً: مفتاح metrics في ملف الإعداد لا تقرؤه كل الإصدارات،
+# ووجود /ready شرطٌ لعمل الوضع التلقائي.
+exec /usr/bin/cloudflared --no-autoupdate --metrics "$MET" \
     --config /etc/xe3000-cf-fulltunnel/cloudflared/config.yml tunnel run
 RUNCFD
+    } >/etc/xe3000-cf-fulltunnel/run-cloudflared.sh
     chmod 750 /etc/xe3000-cf-fulltunnel/run-cloudflared.sh
 
     cat >/etc/init.d/xe3000-cf-tunnel <<'INITCFD'
@@ -2532,8 +2537,9 @@ do_vpn_bypass() {
                         add_bypass_now
                         die "لا يوجد تثبيت مكتمل — الوضع التلقائي يحتاج نفقًا قائمًا.
     أبقيتُ التجاوز مفعّلًا. ثبّت أولًا: sh $SELF auto"; }
-                    say "منفذ المقاييس غير مهيّأ في إعداد cloudflared — أضيفه الآن."
+                    say "منفذ المقاييس غير مهيّأ — أضيفه إلى الإعداد وإلى أمر التشغيل."
                     write_cfd_config
+                    write_init          # الوسيط --metrics يقع في غلاف التشغيل
                     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1
                     _w=0; while [ "$_w" -lt 10 ] && ! cfd_ready_ok; do sleep 3; _w=$((_w+1)); done
                 fi
