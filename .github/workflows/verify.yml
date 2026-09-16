@@ -96,6 +96,103 @@ jobs:
           grep -q '"email": "ahmed"' "$T/base/xray/config.json" && exit 1
           echo "user list drives the xray config"
 
+      - name: Old user schema migrates without touching UUIDs
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          mkdir -p "$T/base/state" "$T/creds"
+          printf 'FULLTUNNEL_HOSTNAME=cdn.a.com\nFULLTUNNEL_TUNNEL_ID=tid-1\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/oldpath\nFULLTUNNEL_PROTO=vless\n' \
+            > "$T/base/state/settings.env"
+          # المخطّط القديم: عمودان بلا كلمة مرور trojan
+          printf '11111111-1111-1111-1111-111111111111\told1\n22222222-2222-2222-2222-222222222222\told2\n' \
+            > "$T/base/state/users.tsv"
+          printf 'zone-aaa' > "$T/creds/zone-id"
+          sudo sh "$T/x.sh" links > "$T/links.txt"
+          sudo chmod -R a+rX "$T"
+          awk -F'\t' 'NF && NF!=3 {print "row not migrated: "$0; bad=1} END{exit bad+0}' \
+            "$T/base/state/users.tsv"
+          # المعرّفات لا تُمسّ — روابط vless القائمة تبقى صالحة بعد الترقية
+          awk -F'\t' '$1=="11111111-1111-1111-1111-111111111111" && $2=="old1" && $3!="" {f=1}
+                      END{exit !f}' "$T/base/state/users.tsv"
+          awk -F'\t' '$1=="22222222-2222-2222-2222-222222222222" && $2=="old2" && $3!="" {f=1}
+                      END{exit !f}' "$T/base/state/users.tsv"
+          # كلمتا المرور مستقلّتان لا نسخة واحدة
+          [ "$(awk -F'\t' 'NF{print $3}' "$T/base/state/users.tsv" | sort -u | wc -l)" = 2 ]
+          # hosts.tsv يُزرع من settings.env + creds/zone-id
+          awk -F'\t' '$1=="cdn.a.com" && $2=="zone-aaa" {f=1} END{exit !f}' \
+            "$T/base/state/hosts.tsv"
+          grep -q 'vless://11111111-1111-1111-1111-111111111111@cdn.a.com' "$T/links.txt"
+          echo "user + host migration ok"
+
+      - name: Both protocols run side by side on separate ports and paths
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          mkdir -p "$T/base/state" "$T/creds"
+          printf 'FULLTUNNEL_HOSTNAME=cdn.a.com\nFULLTUNNEL_TUNNEL_ID=tid-1\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/oldpath\nFULLTUNNEL_PROTO=vless\n' \
+            > "$T/base/state/settings.env"
+          printf 'zone-aaa' > "$T/creds/zone-id"
+          : > "$T/base/state/users.tsv"
+          sudo sh "$T/x.sh" user-add ahmed
+          sudo sh "$T/x.sh" user-add sara
+          sudo sh "$T/x.sh" proto-enable trojan
+          sudo chmod -R a+rX "$T"
+          # settings.env يُقرأ بـ "." — قيمة فيها مسافة تُنفَّذ أمرًا بدل أن تُسنَد
+          grep -q '^FULLTUNNEL_PROTOS=vless,trojan$' "$T/base/state/settings.env"
+          ! grep -qE '^FULLTUNNEL_PROTOS=[^=]* ' "$T/base/state/settings.env"
+          python3 - "$T/base/xray/config.json" <<'PY'
+          import json,sys
+          ib=json.load(open(sys.argv[1]))["inbounds"]
+          got=[(i["protocol"], i["port"]) for i in ib]
+          assert got==[("vless",18443),("trojan",18445)], got
+          paths={i["protocol"]: i["streamSettings"]["wsSettings"]["path"] for i in ib}
+          assert paths["vless"]!=paths["trojan"], paths
+          pw={c["password"] for c in ib[1]["settings"]["clients"]}
+          uid={c["id"] for c in ib[0]["settings"]["clients"]}
+          assert len(pw)==2 and len(uid)==2 and not (pw & uid), (pw, uid)
+          print("inbounds:", got)
+          PY
+          echo "dual protocol ok"
+
+      - name: Multiple hostnames produce ordered ingress rules
+        run: |
+          set -eu
+          T=$(mktemp -d)
+          sed -e "s#^BASE=/etc/xe3000-cf-fulltunnel\$#BASE=$T/base#" \
+              -e "s#^CREDS=/etc/xe3000-cf-fulltunnel-creds\$#CREDS=$T/creds#" \
+              xe3000autouiinput.sh > "$T/x.sh"
+          mkdir -p "$T/base/state" "$T/creds"
+          printf 'FULLTUNNEL_HOSTNAME=cdn.a.com\nFULLTUNNEL_TUNNEL_ID=tid-1\nFULLTUNNEL_XRAY_PORT=18443\nFULLTUNNEL_XRAY_PATH=/oldpath\nFULLTUNNEL_PROTO=vless\n' \
+            > "$T/base/state/settings.env"
+          printf 'zone-aaa' > "$T/creds/zone-id"
+          : > "$T/base/state/users.tsv"
+          sudo sh "$T/x.sh" user-add ahmed
+          printf 'cdn.a.com\tzone-aaa\nstatic.b.net\tzone-bbb\napi.c.org\tzone-ccc\n' \
+            | sudo tee "$T/base/state/hosts.tsv" >/dev/null
+          sudo sh "$T/x.sh" proto-enable trojan
+          sudo chmod -R a+rX "$T"
+          C=$T/base/cloudflared/config.yml
+          cat "$C"
+          # ثلاثة مضيفين × بروتوكولين
+          [ "$(grep -c '^  - hostname: ' "$C")" = 6 ]
+          for h in cdn.a.com static.b.net api.c.org; do
+            [ "$(grep -c "^  - hostname: $h\$" "$C")" = 2 ]
+          done
+          # cloudflared يطابق بالترتيب: قاعدة المسار قبل قاعدة المضيف المجرّدة
+          after=$(grep -A1 -m1 '^  - hostname: ' "$C" | tail -1)
+          case "$after" in
+            "    path:"*) ;;
+            *) echo "path rule must precede the host catch-all, got: $after"; exit 1 ;;
+          esac
+          tail -1 "$C" | grep -q 'http_status:404'
+          echo "multi-host ingress ok"
+
       - name: SHA256SUMS matches tracked files
         run: sha256sum -c SHA256SUMS
 
