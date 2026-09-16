@@ -2147,7 +2147,7 @@ check_offload() {
 do_selftest() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
     need_cmd curl
-    _fail=0; _public_ok=0
+    _fail=0; _public_ok=0; _public_untested=0
 
     say "── 1) الخدمتان ──"
     for _s in xe3000-cf-xray xe3000-cf-tunnel; do
@@ -2451,7 +2451,8 @@ do_selftest() {
             *101*) ok "$_sh [$_sp]: المسار العام يصل إلى xray."; _public_ok=1 ;;
             *404*) err "$_sh [$_sp]: الحافة ترد 404 — المسار لا يطابق قاعدة ingress."; _fail=1 ;;
             curl:*) err "$_sh [$_sp]: curl لم يصل — $_l"
-                    say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)" ;;
+                    say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)"
+                    _public_untested=1 ;;
             '')    err "$_sh [$_sp]: لا سطر استجابة على المسار العام."; _fail=1 ;;
             *)     err "$_sh [$_sp]: ردّ $_l (المتوقع 101)"; _fail=1 ;;
         esac
@@ -2459,7 +2460,20 @@ do_selftest() {
     done
 
     say ""
-    if [ "$_fail" = 0 ]; then
+    if [ "$_fail" = 0 ] && [ "${_public_untested:-0}" = 1 ]; then
+        # الحلقات المحلية سليمة، لكن الطلب العام لم يصل أصلًا فلم يُختبر شيء.
+        # إعلان السلامة هنا خطأ: النفق قد يكون ساقطًا تمامًا.
+        warn "الحلقات المحلية سليمة، لكن **لم أستطع اختبار المسار العام** من الراوتر."
+        say "هذا وحده لا يعني أن النفق يعمل. اختبره من خارج شبكتك:"
+        say "    curl -sS -m 15 -o /dev/null -w '%{http_code}\n' https://$CF_HOSTNAME/"
+        say "    404 = يعمل   |   530 = النفق غير متصل"
+        say ""
+        say "وإن كان خروج الراوتر نفسه معطّلًا فتحقق منه أولًا:"
+        say "    curl -sS -m 8 -o /dev/null -w '%{http_code}\n' https://api.cloudflare.com/client/v4/"
+        say "    مهلة هنا تعني أن الوصلة الخارجية مقطوعة — لا علاقة للنفق بذلك."
+        users_links
+        return 1
+    elif [ "$_fail" = 0 ]; then
         ok "كل الحلقات سليمة. إن فشل التطبيق فالخلل في إعداد العميل:"
         users_links
     elif [ "${_public_ok:-0}" = 1 ]; then
