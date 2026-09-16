@@ -3191,14 +3191,25 @@ do_vpn_route() {
             [ "$(vpnroute_count)" = 2 ] ||
                 die "لم تُضف القاعدتان ($(vpnroute_count)/2) — راجع: ip rule ; ip -6 rule"
 
-            # مُحلِّل يصل داخل النفق: مُحلِّلات المشغّل غالبًا خارجه
+            # مُحلِّل يصل داخل النفق: مُحلِّلات المشغّل غالبًا خارجه.
+            # الضبط في UCI لا في /etc/resolv.conf — OpenWrt يعيد كتابة الملف
+            # عند كل حدث شبكة فيضيع أي تعديل مباشر عليه.
             if ! nslookup api.cloudflare.com >/dev/null 2>&1; then
-                say "المُحلِّل الحالي لا يعمل داخل النفق — أبدّله."
-                [ -f "$VPNROUTE_STATE/resolv.orig" ] || {
-                    mkdir -p "$VPNROUTE_STATE"
-                    cp /etc/resolv.conf "$VPNROUTE_STATE/resolv.orig" 2>/dev/null; }
-                printf 'nameserver %s\n' ${VPNROUTE_RESOLVERS:-1.1.1.1 8.8.8.8} >/etc/resolv.conf
-                nslookup api.cloudflare.com >/dev/null 2>&1 ||
+                say "المُحلِّل الحالي لا يعمل داخل النفق — أضبط dnsmasq."
+                for _i in $(uci show network 2>/dev/null |
+                            sed -n 's/^network\.\([a-z0-9_]*\)=interface$/\1/p'); do
+                    uci -q set "network.$_i.peerdns=0"
+                done
+                uci -q delete dhcp.@dnsmasq[0].server
+                for _r in ${VPNROUTE_RESOLVERS:-1.1.1.1 8.8.8.8}; do
+                    uci -q add_list dhcp.@dnsmasq[0].server="$_r"
+                done
+                uci -q set dhcp.@dnsmasq[0].noresolv=1
+                uci -q commit dhcp; uci -q commit network
+                /etc/init.d/dnsmasq restart >/dev/null 2>&1
+                sleep 3
+                nslookup api.cloudflare.com >/dev/null 2>&1 &&
+                    ok "الترجمة تعمل عبر ${VPNROUTE_RESOLVERS:-1.1.1.1}" ||
                     warn "ما زالت الترجمة تفشل — راجع اتصال الـ VPN."
             fi
 
@@ -3219,10 +3230,10 @@ do_vpn_route() {
         off|0)
             vpnroute_rules_off
             printf 'off\n' >"$VPNROUTE_STATE.mode" 2>/dev/null
-            [ -f "$VPNROUTE_STATE/resolv.orig" ] && {
-                cp "$VPNROUTE_STATE/resolv.orig" /etc/resolv.conf 2>/dev/null
-                rm -f "$VPNROUTE_STATE/resolv.orig"; }
-            ok "أُلغي إدخال المرور إلى الـ VPN — عاد إلى مسار المشغّل المباشر" ;;
+            ok "أُلغي إدخال المرور إلى الـ VPN — عاد إلى مسار المشغّل المباشر"
+            say "ضبط DNS لم يُمسّ. لإعادته إلى مُحلِّلات المشغّل:"
+            say "  uci -q delete dhcp.@dnsmasq[0].server; uci -q delete dhcp.@dnsmasq[0].noresolv"
+            say "  uci commit dhcp && /etc/init.d/dnsmasq restart" ;;
         status)
             _m=$(cat "$VPNROUTE_STATE.mode" 2>/dev/null); [ -n "$_m" ] || _m=off
             _t=$(vpnroute_table)
