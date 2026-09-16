@@ -2747,7 +2747,29 @@ FWIHEAD
     printf 'METRICS="127.0.0.1:%s"\n' "${CFD_METRICS:-20241}"
     printf 'TUNSVC="%s"\n' "/etc/init.d/xe3000-cf-tunnel"
     printf 'RETRY_AFTER=%s\n' "${BYPASS_RETRY:-1800}"
+    printf 'VRMODE="%s"\n' "$VPNROUTE_STATE.mode"
+    printf 'VRPREF=%s\n' "$VPNROUTE_PREF"
     cat <<'FWIBODY'
+
+# إدخال مرور البوابة إلى نفق VPN — قواعد ip rule تزول بإعادة الإقلاع، وهذا
+# الملف يُستدعى من include الجدار الناري فيعيدها. IPv4 وIPv6 معًا: قواعدهما
+# منفصلة، وبلا الثانية يتسرّب مرور IPv6 إلى المشغّل.
+vr_table() {
+    for _t in $(ip rule 2>/dev/null | sed -n 's/.*lookup \([0-9][0-9]*\).*/\1/p' | sort -un); do
+        ip route show table "$_t" 2>/dev/null |
+            awk -v t="$_t" '/^default/ && /dev (wg|tun|ppp|ovpn|vti)/ {print t; exit}'
+    done | head -1
+}
+
+vr_apply() {
+    [ "$(cat "$VRMODE" 2>/dev/null)" = on ] || return 0
+    _vt=$(vr_table); [ -n "$_vt" ] || {
+        logger -t xe3000 "vpn-route: لا أرى جدول نفق VPN — تُركت القواعد"; return 0; }
+    ip rule    | grep -q "^$VRPREF:" || ip rule    add pref "$VRPREF" iif lo lookup "$_vt" 2>/dev/null
+    ip -6 rule | grep -q "^$VRPREF:" || ip -6 rule add pref "$VRPREF" iif lo lookup "$_vt" 2>/dev/null
+    :
+}
+vr_apply
 
 _rule() { # $1=عملية $2=بروتوكول $3=منفذ
     iptables -w -t mangle "$1" OUTPUT -p "$2" --dport "$3" -m mark --mark 0x0/0xf000 \
@@ -3111,6 +3133,110 @@ do_set_edge_proto() {
     say "ابحث عن Registered tunnel connection — ظهورها يعني أن الوصلة قامت."
 }
 
+# ── إدخال مرور البوابة إلى نفق VPN (نقيض vpn-bypass) ──
+# حين يكون المشغّل هو مصدر القيد، المطلوب ألا يرى إلا حزمًا مشفّرة. سياسة
+# GL.iNet تمرّر أجهزة الشبكة عبر الـ VPN وتترك ما ينشئه الراوتر يخرج مباشرة:
+# القاعدة المقصودة موجودة عندها بأولوية 90019، أي بعد "32766 main" فلا تُستعمل.
+#
+# ثلاث قطع، ولا واحدة تكفي وحدها:
+#   1) قاعدة IPv4 بأولوية بين 6000 (حيث تخرج حزم VPN المشفّرة نفسها) و32766
+#   2) قاعدة IPv6 — قواعد IPv6 منفصلة تمامًا، وبدونها يتسرّب المرور للمشغّل
+#   3) مُحلِّل DNS يصل داخل النفق — مُحلِّلات المشغّل لا وجود لها فيه
+VPNROUTE_PREF=7000
+VPNROUTE_STATE="$BASE/state/vpn-route"
+VPNROUTE_DNS="$BASE/state/resolv.vpn"
+
+# جدول التوجيه الذي مساره الافتراضي عبر نفق VPN
+vpnroute_table() {
+    for _t in $(ip rule 2>/dev/null | sed -n 's/.*lookup \([0-9][0-9]*\).*/\1/p' | sort -un); do
+        ip route show table "$_t" 2>/dev/null |
+            awk '/^default/ && /dev (wg|tun|ppp|ovpn|vti)/ {print "'"$_t"'"; exit}'
+    done | head -1
+}
+
+vpnroute_dev() {
+    _t=${1:-$(vpnroute_table)}
+    [ -n "$_t" ] || return 1
+    ip route show table "$_t" 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+vpnroute_rules_on() { # $1 = رقم الجدول
+    ip rule    add pref "$VPNROUTE_PREF" iif lo lookup "$1" 2>/dev/null
+    ip -6 rule add pref "$VPNROUTE_PREF" iif lo lookup "$1" 2>/dev/null
+    :
+}
+
+vpnroute_rules_off() {
+    while ip rule    del pref "$VPNROUTE_PREF" 2>/dev/null; do :; done
+    while ip -6 rule del pref "$VPNROUTE_PREF" 2>/dev/null; do :; done
+    :
+}
+
+vpnroute_count() {
+    _n=0
+    ip rule    2>/dev/null | grep -q "^$VPNROUTE_PREF:" && _n=$((_n+1))
+    ip -6 rule 2>/dev/null | grep -q "^$VPNROUTE_PREF:" && _n=$((_n+1))
+    printf '%s' "$_n"
+}
+
+do_vpn_route() {
+    need_root
+    case "${1:-status}" in
+        on|1)
+            _t=$(vpnroute_table)
+            [ -n "$_t" ] || die "لا أرى جدول توجيه مساره الافتراضي عبر نفق VPN.
+    تأكد أن الـ VPN متصل: wg show   أو   ip route show table all | grep default"
+            _dev=$(vpnroute_dev "$_t")
+            vpnroute_rules_on "$_t"
+            [ "$(vpnroute_count)" = 2 ] ||
+                die "لم تُضف القاعدتان ($(vpnroute_count)/2) — راجع: ip rule ; ip -6 rule"
+
+            # مُحلِّل يصل داخل النفق: مُحلِّلات المشغّل غالبًا خارجه
+            if ! nslookup api.cloudflare.com >/dev/null 2>&1; then
+                say "المُحلِّل الحالي لا يعمل داخل النفق — أبدّله."
+                [ -f "$VPNROUTE_STATE/resolv.orig" ] || {
+                    mkdir -p "$VPNROUTE_STATE"
+                    cp /etc/resolv.conf "$VPNROUTE_STATE/resolv.orig" 2>/dev/null; }
+                printf 'nameserver %s\n' ${VPNROUTE_RESOLVERS:-1.1.1.1 8.8.8.8} >/etc/resolv.conf
+                nslookup api.cloudflare.com >/dev/null 2>&1 ||
+                    warn "ما زالت الترجمة تفشل — راجع اتصال الـ VPN."
+            fi
+
+            mkdir -p "$STATE"; printf 'on\n' >"$VPNROUTE_STATE.mode" 2>/dev/null
+            write_fwinclude
+            uci -q delete firewall.xe3000_inc
+            uci set firewall.xe3000_inc=include
+            uci set firewall.xe3000_inc.path="$BASE/firewall.sh"
+            uci set firewall.xe3000_inc.reload=1
+            uci commit firewall
+
+            ok "مرور البوابة يسلك نفق VPN عبر $_dev (جدول $_t)"
+            _g=$(ip route get 198.41.192.7 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p')
+            [ "$_g" = "$_dev" ] && ok "تحقّق: الخروج فعلًا عبر $_g" ||
+                warn "الخروج ما زال عبر ${_g:-غير معروف} — راجع: ip route get 198.41.192.7"
+            say "يصمد بعد إعادة تشغيل الجدار الناري والجهاز."
+            say "أعد تشغيل النفق ليطلب المسار الجديد: /etc/init.d/xe3000-cf-tunnel restart" ;;
+        off|0)
+            vpnroute_rules_off
+            printf 'off\n' >"$VPNROUTE_STATE.mode" 2>/dev/null
+            [ -f "$VPNROUTE_STATE/resolv.orig" ] && {
+                cp "$VPNROUTE_STATE/resolv.orig" /etc/resolv.conf 2>/dev/null
+                rm -f "$VPNROUTE_STATE/resolv.orig"; }
+            ok "أُلغي إدخال المرور إلى الـ VPN — عاد إلى مسار المشغّل المباشر" ;;
+        status)
+            _m=$(cat "$VPNROUTE_STATE.mode" 2>/dev/null); [ -n "$_m" ] || _m=off
+            _t=$(vpnroute_table)
+            say "الوضع     : $_m"
+            say "جدول VPN  : ${_t:-لا يوجد} ($(vpnroute_dev "$_t" 2>/dev/null || echo '—'))"
+            say "القواعد   : $(vpnroute_count)/2  (IPv4 و IPv6)"
+            say "خروج IPv4 : $(ip route get 198.41.192.7 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p')"
+            say "المُحلِّل   : $(sed -n 's/^nameserver //p' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+            nslookup api.cloudflare.com >/dev/null 2>&1 &&
+                say "الترجمة   : تعمل" || warn "الترجمة   : تفشل" ;;
+        *) die "الاستعمال: vpn-route on|off|status" ;;
+    esac
+}
+
 do_vpn_bypass() {
     need_root
     # بلا هذا تكون كل القيم فارغة، فيولّد write_cfd_config إعدادًا بلا مضيف.
@@ -3283,6 +3409,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF host-del <مضيف>  إزالة مضيف من النفق
   sh $SELF set-zone-token <zone-id> [off]  توكن خاص بنطاق واحد
   sh $SELF set-edge-protocol <http2|quic|auto>  بروتوكول وصلة الحافة
+  sh $SELF vpn-route on|off|status  أدخِل مرور البوابة إلى نفق VPN
   sh $SELF vpn-bypass auto|on|off|status  الـ VPN مفضّل، والتجاوز عند فشله
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
   sh $SELF menu             قائمة تفاعلية عبر SSH (أو الأمر menu مباشرة)
@@ -3332,6 +3459,7 @@ case "${1:-}" in
     host-del)           do_host_del "${2:-}" ;;
     set-zone-token)     do_set_zone_token "${2:-}" "${3:-}" ;;
     set-edge-protocol)  do_set_edge_proto "${2:-}" ;;
+    vpn-route)          do_vpn_route "${2:-status}" ;;
     vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
     user-list)          load_settings >/dev/null 2>&1; users_list ;;
