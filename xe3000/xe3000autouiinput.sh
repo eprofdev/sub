@@ -2498,6 +2498,63 @@ fw_bypass_total() { set -- $FW_BYPASS_PORTS; printf '%s' "$#"; }
 
 # بعض الشبكات تقطع مصافحة TLS إلى حافة Cloudflare على 7844/TCP بينما تمرّر
 # 7844/UDP (quic) أو العكس. هذا يبدّل الاثنين بلا مساس بأي إعداد آخر.
+# اسم المضيف يُختار بحرية داخل نطاقك — مثل cdn أو youtube — لأن الاسم هو ما
+# يراه الفاحص في SNI. يُنشأ سجل CNAME جديد ويُبقى القديم فلا ينقطع من يستعمله.
+do_set_hostname() {
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    [ -n "$TUNNEL_ID" ] || die "لا يوجد نفق — ثبّت أولًا: sh $SELF auto"
+    _new=${1:-}
+    if [ -z "$_new" ]; then
+        has_tty || die "الاستعمال: set-hostname <اسم.نطاقك>"
+        say "المضيف الحالي: $CF_HOSTNAME"
+        read_tty "المضيف الجديد (مثل cdn.example.com): " _new
+    fi
+    valid_host "$_new" || die "اسم مضيف غير صالح: '$_new'"
+    [ "$_new" = "$CF_HOSTNAME" ] && { ok "لا تغيير — المضيف هو نفسه."; return 0; }
+
+    collect_creds
+    _r=$(cf GET "/zones/$CF_ZONE")
+    cf_success "$_r" || die "تعذر قراءة النطاق: $(cf_errors "$_r")"
+    _zn=$(jf "$_r" '@.result.name')
+    case "$_new" in
+        "$_zn"|*".$_zn") : ;;
+        *) die "'$_new' ليس تابعًا للنطاق '$_zn' — لا يمكن إنشاء سجل له." ;;
+    esac
+
+    # شهادة Universal SSL على إعداد full تغطي النطاق والمستوى الأول فقط.
+    # اسم مثل youtube.com.example.com مستوى ثانٍ فتفشل مصافحة TLS بخطأ شهادة.
+    _sub=${_new%".$_zn"}
+    case "$_sub" in
+        "$_new") _depth=0 ;;
+        *.*)     _depth=2 ;;
+        *)       _depth=1 ;;
+    esac
+    if [ "$_depth" = 2 ]; then
+        warn "'$_new' نطاق فرعي من المستوى الثاني."
+        say  "    شهادة Cloudflare المجانية (Universal SSL) تغطي النطاق والمستوى"
+        say  "    الأول فقط، فمصافحة TLS ستفشل بخطأ شهادة ما لم تكن مشتركًا في"
+        say  "    Advanced Certificate Manager أو Total TLS."
+        say  "    البديل المجاني: اسم من مستوى واحد مثل ${_sub%%.*}.$_zn"
+        if has_tty && [ "${FULLTUNNEL_FORCE:-0}" != 1 ]; then
+            read_tty "أتابع رغم ذلك؟ (اكتب نعم): " _y
+            [ "$_y" = "نعم" ] || die "أُلغي — لم يتغيّر شيء."
+        fi
+    fi
+
+    _old=$CF_HOSTNAME
+    CF_HOSTNAME=$_new
+    create_or_update_dns || { CF_HOSTNAME=$_old; die "فشل إنشاء السجل — لم يتغيّر شيء."; }
+    save_settings
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "المضيف الآن: $CF_HOSTNAME"
+    say "سجل $_old لم يُحذف — احذفه من لوحة Cloudflare إن لم تعد تحتاجه."
+    say "انتظر انتشار DNS دقيقة ثم: sh $SELF selftest"
+    warn "روابط العملاء تغيّرت — أعد استيرادها:"
+    users_links
+}
+
 do_set_edge_proto() {
     need_root
     load_settings || die "لا يوجد تثبيت محلي."
@@ -2667,6 +2724,7 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-protocol <vless|trojan>  تبديل البروتوكول
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
+  sh $SELF set-hostname <اسم>  تبديل اسم المضيف داخل نطاقك
   sh $SELF set-edge-protocol <http2|quic|auto>  بروتوكول وصلة الحافة
   sh $SELF vpn-bypass auto|on|off|status  الـ VPN مفضّل، والتجاوز عند فشله
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
@@ -2708,6 +2766,7 @@ case "${1:-}" in
     set-protocol)       do_set_protocol "${2:-}" ;;
     ssh-ws)             do_sshws "${2:-}" ;;
     watchdog)           do_watchdog "${2:-}" "${3:-}" ;;
+    set-hostname)       do_set_hostname "${2:-}" ;;
     set-edge-protocol)  do_set_edge_proto "${2:-}" ;;
     vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
