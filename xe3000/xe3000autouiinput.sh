@@ -4,7 +4,7 @@
 # ملف واحد، بلا حمولة مضمّنة — يعمل مع wget/curl إلى ملف ثم sh.
 set -u
 
-VERSION="2026-09-12-single-file"
+VERSION="2026-09-16-multi-host"
 
 BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
@@ -27,6 +27,8 @@ CF_HOSTNAME=; CF_ACCOUNT=; CF_ZONE=; CF_TOKEN=
 TUNNEL_ID=; TUNNEL_NAME=; TUNNEL_SECRET=
 XRAY_UUID=; XRAY_PORT=; XRAY_WSPATH=; XRAY_LISTEN=; XRAY_NET=
 XRAY_PROTO=; SSHWS=; SSH_PATH=; SSH_PORT=; CFD_PROTO=; CFD_EDGE_IP=; CFD_METRICS=
+# قائمة البروتوكولات المفعّلة معًا، ومسار/منفذ trojan المستقلّين عن vless
+XRAY_PROTOS=; TROJAN_PATH=; TROJAN_PORT=
 
 # ----------------------------------------------------------------- رسائل
 say()  { printf '%s\n' "$*"; }
@@ -135,6 +137,8 @@ creds_status() {
         say "  الحساب     : $(cat "$CREDS/account-id" | cut -c1-8)…"
         say "  النطاق     : $(cat "$CREDS/zone-id" | cut -c1-8)…"
         say "  التوكن     : محفوظ (لا يُعرض)"
+        _zt=$(ls "$CREDS" 2>/dev/null | sed -n 's/^zone-token-//p' | tr '\n' ' ')
+        [ -n "$_zt" ] && say "  توكن لكل نطاق: $_zt"
         say "  المسار     : $CREDS (700/600)"
     else
         say "بيانات Cloudflare: غير محفوظة"
@@ -335,7 +339,89 @@ prepare_runtime() {
 }
 
 # ----------------------------------------------------------------- المستخدمون
-USERS=$STATE/users.tsv     # سطر لكل مستخدم: uuid<TAB>الاسم
+USERS=$STATE/users.tsv     # سطر لكل مستخدم: uuid<TAB>الاسم<TAB>كلمة مرور trojan
+HOSTS=$STATE/hosts.tsv     # سطر لكل مضيف: المضيف<TAB>معرّف النطاق
+
+gen_pass() { head -c 32 /dev/urandom | md5sum | cut -c1-24; }
+
+# ----------------------------------------------------------------- المضيفون
+# نفق واحد يخدم كل النطاقات: قاعدة ingress لكل مضيف، وسجل CNAME في كل نطاق
+# يشير إلى النفق نفسه. التعدّد يوزّع الخطر — حجب نطاق لا يسقط البقية.
+hosts_init() {
+    mkdir -p "$STATE"
+    [ -f "$HOSTS" ] || { : >"$HOSTS"; chmod 600 "$HOSTS"; }
+    # صفّ بلا معرّف نطاق: كُتب من سياق لم يقرأ البيانات المحفوظة (نداء بلا root
+    # مثلًا). يُستكمل هنا، وإلا فشل تجديد سجل DNS للمضيف الأوّل بلا سبب ظاهر.
+    # لا يطال إلا الأوّل: host-add لا يقبل مضيفًا بلا معرّف نطاق.
+    if [ -s "$HOSTS" ]; then
+        awk -F'\t' 'NF && $2==""{f=1} END{exit !f}' "$HOSTS" 2>/dev/null || return 0
+        _hz=${CF_ZONE:-}
+        [ -n "$_hz" ] || _hz=$(cat "$CREDS/zone-id" 2>/dev/null)
+        [ -n "$_hz" ] || return 0
+        _ht=$STATE/.hosts.fix.$$
+        awk -F'\t' -v z="$_hz" 'NF{ printf "%s\t%s\n", $1, ($2==""?z:$2) }' "$HOSTS" >"$_ht" 2>/dev/null &&
+            [ -s "$_ht" ] && mv "$_ht" "$HOSTS" && chmod 600 "$HOSTS" || rm -f "$_ht"
+        return 0
+    fi
+    # ترقية تثبيت بمضيف واحد: المضيف كان في settings.env والنطاق في ملف البيانات
+    _hh=${CF_HOSTNAME:-}
+    [ -n "$_hh" ] || _hh=$(sed -n 's/^FULLTUNNEL_HOSTNAME=//p' "$SETTINGS" 2>/dev/null | head -1)
+    [ -n "$_hh" ] || return 0
+    _hz=${CF_ZONE:-}
+    [ -n "$_hz" ] || _hz=$(cat "$CREDS/zone-id" 2>/dev/null)
+    printf '%s\t%s\n' "$_hh" "$_hz" >"$HOSTS"
+    chmod 600 "$HOSTS"
+}
+
+hosts_names()  { hosts_init; awk -F'\t' 'NF{print $1}' "$HOSTS" 2>/dev/null; }
+hosts_count()  { hosts_init; awk -F'\t' 'NF{n++} END{print n+0}' "$HOSTS" 2>/dev/null || echo 0; }
+host_zone()    { awk -F'\t' -v h="$1" '$1==h{print $2; exit}' "$HOSTS" 2>/dev/null; }
+host_primary() { hosts_init; awk -F'\t' 'NF{print $1; exit}' "$HOSTS" 2>/dev/null; }
+host_known()   { hosts_init; awk -F'\t' -v h="$1" '$1==h{f=1} END{exit !f}' "$HOSTS" 2>/dev/null; }
+
+hosts_list() {
+    hosts_init
+    [ -s "$HOSTS" ] || { say "لا يوجد مضيفون."; return 0; }
+    _i=0
+    while IFS="$(printf '\t')" read -r _h _z; do
+        [ -n "$_h" ] || continue
+        _i=$((_i+1))
+        [ -s "$CREDS/zone-token-$_z" ] && _tk="توكن خاص" || _tk="التوكن العام"
+        printf '%2d) %-28s zone=%s  (%s)\n' "$_i" "$_h" "$(printf '%s' "$_z" | cut -c1-8)…" "$_tk"
+    done <"$HOSTS"
+}
+
+# توكن مقصور على نطاق واحد أضيق صلاحية: سحبه لا يعطّل بقية النطاقات. وإن لم
+# يوجد فالتوكن العام — فحسابٌ بتوكن واحد يظل يعمل بلا إعداد إضافي.
+zone_token() {
+    if [ -n "${1:-}" ] && [ -s "$CREDS/zone-token-$1" ]; then cat "$CREDS/zone-token-$1"
+    else printf '%s' "$CF_TOKEN"; fi
+}
+
+# ----------------------------------------------------------------- البروتوكولات
+# vless وtrojan يعملان معًا: لكل واحد منفذه ومساره، وتفصل بينهما الحافة بالمسار.
+# تعطيل بروتوكول لا يمسّ قائمة المستخدمين — من عُطّل بروتوكوله يبقى مستخدمًا.
+protos_enabled() {
+    _pe=${XRAY_PROTOS:-}
+    [ -n "$_pe" ] || _pe=${XRAY_PROTO:-vless}
+    _pe=$(printf '%s' "$_pe" | tr ',' ' ')
+    # ترتيب ثابت وتصفية القيم المجهولة: inbounds[0] يبقى vless متى كان مفعّلًا
+    _po=
+    for _pc in vless trojan; do
+        for _pt in $_pe; do
+            [ "$_pt" = "$_pc" ] && { _po="$_po${_po:+ }$_pc"; break; }
+        done
+    done
+    [ -n "$_po" ] || _po=vless
+    printf '%s' "$_po"
+}
+
+protos_count() { protos_enabled | tr ' ' '\n' | awk 'NF{n++} END{print n+0}'; }
+
+proto_on() { # $1 = vless|trojan
+    for _pp in $(protos_enabled); do [ "$_pp" = "$1" ] && return 0; done
+    return 1
+}
 
 users_init() {
     mkdir -p "$STATE"
@@ -344,11 +430,33 @@ users_init() {
     if [ ! -s "$USERS" ] && [ -f "$SETTINGS" ]; then
         _mu=$(sed -n 's/^FULLTUNNEL_XRAY_UUID=//p' "$SETTINGS" | head -1)
         if [ -n "$_mu" ]; then
-            printf '%s\t%s\n' "$_mu" "${FULLTUNNEL_USER:-user1}" >"$USERS"
+            printf '%s\t%s\t%s\n' "$_mu" "${FULLTUNNEL_USER:-user1}" "$(gen_pass)" >"$USERS"
             chmod 600 "$USERS"
-            ok "رُحِّل المستخدم الموجود من settings.env — معرّفه لم يتغيّر."
+            ok "رُحِّل المستخدم الموجود من settings.env — معرّفه لم يتغيّر." >&2
         fi
     fi
+    users_migrate_pw
+}
+
+# المخطّط القديم سطران: uuid<TAB>الاسم. الجديد يضيف كلمة مرور trojan مستقلّة
+# لكل مستخدم. المعرّفات لا تُمسّ، فروابط vless القائمة تبقى صالحة بعد الترقية.
+# الرسائل إلى stderr: users_init تُنادى داخل $(…) فأي طباعة تفسد القيمة.
+users_migrate_pw() {
+    [ -s "$USERS" ] || return 0
+    awk -F'\t' 'NF && NF<3 {f=1} END{exit !f}' "$USERS" 2>/dev/null || return 0
+    _mt=$STATE/.users.mig.$$
+    : >"$_mt" 2>/dev/null || { warn "تعذّرت ترقية قائمة المستخدمين — لم يتغيّر شيء." >&2; return 1; }
+    while IFS="$(printf '\t')" read -r _mu _mn _mp; do
+        [ -n "$_mu" ] || continue
+        [ -n "$_mp" ] || _mp=$(gen_pass)
+        printf '%s\t%s\t%s\n' "$_mu" "$_mn" "$_mp" >>"$_mt"
+    done <"$USERS"
+    # القياس من الملف نفسه: عدد السطور يجب أن يطابق قبل الاستبدال
+    if [ "$(awk 'NF{n++} END{print n+0}' "$_mt")" != "$(awk 'NF{n++} END{print n+0}' "$USERS")" ]; then
+        rm -f "$_mt"; warn "ترقية القائمة غير مكتملة — أُبقيت القديمة." >&2; return 1
+    fi
+    mv "$_mt" "$USERS" && chmod 600 "$USERS" &&
+        ok "رُقّيت قائمة المستخدمين: كلمة مرور trojan مستقلّة لكل مستخدم." >&2
 }
 
 users_count() { users_init; awk 'NF{n++} END{print n+0}' "$USERS" 2>/dev/null || echo 0; }
@@ -357,10 +465,11 @@ users_list() {
     users_init
     [ -s "$USERS" ] || { say "لا يوجد مستخدمون."; return 0; }
     _i=0
-    while IFS="$(printf '\t')" read -r _u _n; do
+    while IFS="$(printf '\t')" read -r _u _n _p; do
         [ -n "$_u" ] || continue
         _i=$((_i+1))
         printf '%2d) %-20s %s\n' "$_i" "$_n" "$_u"
+        printf '    كلمة مرور trojan: %s\n' "${_p:-—}"
     done <"$USERS"
 }
 
@@ -376,7 +485,8 @@ user_add() { # $1 الاسم (اختياري)
     case "$_n" in *[!A-Za-z0-9_.-]*) die "اسم غير صالح: استخدم حروفًا وأرقامًا و . _ - فقط." ;; esac
     user_name_free "$_n" || die "الاسم '$_n' مستخدم بالفعل."
     _u=$(cat /proc/sys/kernel/random/uuid)
-    printf '%s\t%s\n' "$_u" "$_n" >>"$USERS"
+    # معرّف vless وكلمة مرور trojan مستقلّان: كشف أحدهما لا يسلّم الآخر
+    printf '%s\t%s\t%s\n' "$_u" "$_n" "$(gen_pass)" >>"$USERS"
     chmod 600 "$USERS"
     ok "أُضيف المستخدم $_n"
     printf '%s' "$_u"
@@ -393,31 +503,57 @@ user_del() { # $1 اسم أو uuid
     ok "حُذف المستخدم $_k"
 }
 
-user_link() { # $1 uuid  $2 الاسم
-    _ep=$(printf '%s' "$XRAY_WSPATH" | sed 's|/|%2F|g')
+# مسار مستقلّ لكل بروتوكول — به تفصل الحافة بينهما على المضيف نفسه
+proto_path() { # $1 = vless|trojan
+    case "$1" in
+        trojan) printf '%s' "${TROJAN_PATH:-$XRAY_WSPATH}" ;;
+        *)      printf '%s' "$XRAY_WSPATH" ;;
+    esac
+}
+
+# وسم الرابط يفرّق بين نسخه: المضيف حين يتعدّد، والبروتوكول حين يعمل الاثنان.
+# بلا ذلك تستورد تطبيقات العملاء روابط متطابقة الاسم فيضيع أيّها يعمل.
+link_tag() { # $1 اسم المستخدم  $2 المضيف  $3 البروتوكول
+    _tg=$1
+    [ "$(hosts_count)" -gt 1 ] && _tg="$_tg@${2%%.*}"
+    [ "$(protos_count)" -gt 1 ] && _tg="$_tg-$3"
+    printf '%s' "$_tg"
+}
+
+user_link() { # $1 uuid  $2 الاسم  $3 كلمة مرور trojan  $4 المضيف  $5 البروتوكول
+    _lu=$1; _ln=$2; _lp=${3:-}; _lh=${4:-$CF_HOSTNAME}; _lpr=${5:-vless}
+    [ -n "$_lp" ] || _lp=$_lu
+    _ep=$(proto_path "$_lpr" | sed 's|/|%2F|g')
     case "${XRAY_NET:-ws}" in
         xhttp) _extra='&mode=auto' ;;
         *)     _extra= ;;
     esac
-    case "${XRAY_PROTO:-vless}" in
+    _lt=$(link_tag "$_ln" "$_lh" "$_lpr")
+    case "$_lpr" in
         trojan)
             printf 'trojan://%s@%s:443?security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
-                "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2" ;;
+                "$_lp" "$_lh" "$_lh" "${XRAY_NET:-ws}" "$_lh" "$_ep" "$_extra" "$_lt" ;;
         *)
             printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&type=%s&host=%s&path=%s%s#%s' \
-                "$1" "$CF_HOSTNAME" "$CF_HOSTNAME" "${XRAY_NET:-ws}" "$CF_HOSTNAME" "$_ep" "$_extra" "$2" ;;
+                "$_lu" "$_lh" "$_lh" "${XRAY_NET:-ws}" "$_lh" "$_ep" "$_extra" "$_lt" ;;
     esac
 }
 
 users_links() {
     load_settings || die "لا يوجد تثبيت محلي. شغّل install أولًا."
-    users_init
+    users_init; hosts_init
     [ -s "$USERS" ] || { say "لا يوجد مستخدمون."; return 0; }
-    while IFS="$(printf '\t')" read -r _u _n; do
+    _hn=$(hosts_names)
+    [ -n "$_hn" ] || _hn=$CF_HOSTNAME
+    while IFS="$(printf '\t')" read -r _u _n _p; do
         [ -n "$_u" ] || continue
         say ""
         say "[$_n]"
-        user_link "$_u" "$_n"; say ""
+        for _lh in $_hn; do
+            for _lpr in $(protos_enabled); do
+                user_link "$_u" "$_n" "$_p" "$_lh" "$_lpr"; say ""
+            done
+        done
     done <"$USERS"
     show_ssh
 }
@@ -446,9 +582,19 @@ cfd_service() {
     else printf 'http://%s:%s' "$XRAY_LISTEN" "$XRAY_PORT"; fi
 }
 
+trojan_port()   { printf '%s' "${TROJAN_PORT:-$(( ${XRAY_PORT:-18443} + 2 ))}"; }
+# مقبس ثانٍ في وضع unix، منفذ ثانٍ في وضع TCP — المنفذ +1 محجوز لجسر SSH
+trojan_listen() { if is_sock; then printf '%s-trojan' "$XRAY_LISTEN"
+                  else printf '%s' "$XRAY_LISTEN"; fi; }
+trojan_service(){ if is_sock; then printf 'unix:%s-trojan' "$XRAY_LISTEN"
+                  else printf 'http://%s:%s' "$XRAY_LISTEN" "$(trojan_port)"; fi; }
+
 write_cfd_config() {
     # حارس: منادٍ نسي load_settings كان يولّد "service: http://:" فيرفضه cloudflared
-    [ -n "$TUNNEL_ID" ] && [ -n "$CF_HOSTNAME" ] ||
+    hosts_init
+    _hn=$(hosts_names)
+    [ -n "$_hn" ] || _hn=${CF_HOSTNAME:-}
+    [ -n "$TUNNEL_ID" ] && [ -n "$_hn" ] ||
         die "لا يمكن كتابة إعداد cloudflared بلا معرّف نفق واسم مضيف — حمّل الإعدادات أولًا."
     mkdir -p "$CFD_DIR"
     # أصل unix: بلا اسم مضيف يجعل cloudflared يفشل بـ "no Host in request URL"
@@ -459,13 +605,23 @@ write_cfd_config() {
     else
         _oreq=
     fi
-    _sshrule=
-    if [ "${SSHWS:-0}" = 1 ] && ! is_sock; then
-        _sshrule="  - hostname: $CF_HOSTNAME
-    path: ^$SSH_PATH
-    service: http://$XRAY_LISTEN:$SSH_PORT
-"
-    fi
+    # قاعدة لكل (مضيف × بروتوكول). القواعد ذات المسار أولًا لأن cloudflared
+    # يطابق بالترتيب: قاعدة المضيف بلا مسار تبتلع كل شيء لو سبقتها.
+    _nl='
+'
+    _ing=
+    for _ch in $_hn; do
+        if [ "${SSHWS:-0}" = 1 ] && ! is_sock; then
+            _ing="$_ing  - hostname: $_ch$_nl    path: ^$SSH_PATH$_nl    service: http://$XRAY_LISTEN:$SSH_PORT$_nl"
+        fi
+        if proto_on trojan; then
+            _ing="$_ing  - hostname: $_ch$_nl    path: ^$(proto_path trojan)$_nl    service: $(trojan_service)$_oreq$_nl"
+        fi
+        if proto_on vless; then
+            _ing="$_ing  - hostname: $_ch$_nl    service: $(cfd_service)$_oreq$_nl"
+        fi
+    done
+    [ -n "$_ing" ] || die "لا قاعدة ingress — لا مضيف مفعّل ولا بروتوكول."
     # القيم النصّية بين علامتي اقتباس: YAML تقرأ 4 عددًا وcloudflared يتوقع نصًّا
     # فيرفض الملف كله ويخرج قبل أن يفتح أي شيء.
     cat >"$CFD_DIR/config.yml.new" <<CFDCFG
@@ -481,9 +637,7 @@ metrics: "127.0.0.1:${CFD_METRICS:-20241}"
 no-autoupdate: true
 loglevel: info
 ingress:
-$_sshrule  - hostname: $CF_HOSTNAME
-    service: $(cfd_service)$_oreq
-  - service: http_status:404
+$_ing  - service: http_status:404
 CFDCFG
     [ -s "$CFD_DIR/config.yml.new" ] || { rm -f "$CFD_DIR/config.yml.new"
         die "فشلت كتابة إعداد cloudflared."; }
@@ -505,30 +659,45 @@ write_xray_config() {
     mkdir -p "$XRAY_DIR" || die "تعذر إنشاء $XRAY_DIR"
     users_init
     [ -s "$USERS" ] || die "لا يوجد مستخدمون."
-    if is_sock; then
-        _addr="\"listen\": \"$XRAY_LISTEN\","
-        _sock=', "sockopt": { "domainSockets": {} }'
-        rm -f "$XRAY_LISTEN"
-    else
-        _addr="\"listen\": \"$XRAY_LISTEN\", \"port\": $XRAY_PORT,"
-        # TFO معطّل: نواة هذا الجهاز تُنشئ معه طلبات اتصال بعناوين مصفّرة
-        _sock=', "sockopt": { "tcpFastOpen": false }'
-    fi
-    case "${XRAY_NET:-ws}" in
-        xhttp) _stream="\"network\": \"xhttp\", \"xhttpSettings\": { \"path\": \"$XRAY_WSPATH\", \"mode\": \"auto\" }" ;;
-        *)     _stream="\"network\": \"ws\", \"wsSettings\": { \"path\": \"$XRAY_WSPATH\" }" ;;
-    esac
-    # trojan يستعمل كلمة مرور وvless معرّفًا — نفس القائمة تخدم الاثنين
-    case "${XRAY_PROTO:-vless}" in
-        trojan)
-            _proto=trojan
-            _cl=$(awk -F'\t' 'NF{ printf "%s{ \"password\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
-            _settings="{ \"clients\": [ $_cl ] }" ;;
-        *)
-            _proto=vless
-            _cl=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
-            _settings="{ \"clients\": [ $_cl ], \"decryption\": \"none\" }" ;;
-    esac
+    # مدخل مستقلّ لكل بروتوكول مفعّل: منفذه ومساره وقائمة عملائه. تعطيل
+    # بروتوكول يحذف مدخله وحده — قائمة المستخدمين لا تُمسّ.
+    _inb=
+    for _wp in $(protos_enabled); do
+        case "$_wp" in
+            trojan)
+                # الحقل الثالث كلمة مرور trojan؛ سطر لم يُرحَّل بعد يقع على المعرّف
+                _cl=$(awk -F'\t' 'NF{ printf "%s{ \"password\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), ($3!=""?$3:$1), $2 }' "$USERS")
+                _settings="{ \"clients\": [ $_cl ] }"
+                _wl=$(trojan_listen); _wport=$(trojan_port) ;;
+            vless)
+                _cl=$(awk -F'\t' 'NF{ printf "%s{ \"id\": \"%s\", \"email\": \"%s\" }", (n++?", ":""), $1, $2 }' "$USERS")
+                _settings="{ \"clients\": [ $_cl ], \"decryption\": \"none\" }"
+                _wl=$XRAY_LISTEN; _wport=$XRAY_PORT ;;
+            *) continue ;;
+        esac
+        if is_sock; then
+            _addr="\"listen\": \"$_wl\","
+            _sock=', "sockopt": { "domainSockets": {} }'
+            rm -f "$_wl"
+        else
+            _addr="\"listen\": \"$_wl\", \"port\": $_wport,"
+            # TFO معطّل: نواة هذا الجهاز تُنشئ معه طلبات اتصال بعناوين مصفّرة
+            _sock=', "sockopt": { "tcpFastOpen": false }'
+        fi
+        _wpath=$(proto_path "$_wp")
+        case "${XRAY_NET:-ws}" in
+            xhttp) _stream="\"network\": \"xhttp\", \"xhttpSettings\": { \"path\": \"$_wpath\", \"mode\": \"auto\" }" ;;
+            *)     _stream="\"network\": \"ws\", \"wsSettings\": { \"path\": \"$_wpath\" }" ;;
+        esac
+        _inb="$_inb${_inb:+,}
+    {
+      $_addr
+      \"protocol\": \"$_wp\",
+      \"settings\": $_settings,
+      \"streamSettings\": { $_stream$_sock }
+    }"
+    done
+    [ -n "$_inb" ] || die "لا بروتوكول مفعّل — فعّل واحدًا: sh $SELF proto-enable vless"
 
     # جسر SSH عبر WebSocket: منفذ ثانٍ يمرّر البايتات الخام إلى خادم SSH المحلي
     _ssh=
@@ -545,13 +714,7 @@ write_xray_config() {
     cat >"$XRAY_DIR/config.json.new" <<XRAYCFG
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      $_addr
-      "protocol": "$_proto",
-      "settings": $_settings,
-      "streamSettings": { $_stream$_sock }
-    }$_ssh
+  "inbounds": [$_inb$_ssh
   ],
   "outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
 }
@@ -584,22 +747,51 @@ create_tunnel() {
     ok "أُنشئ النفق $TUNNEL_NAME ($TUNNEL_ID)"
 }
 
-create_or_update_dns() {
+# سجل واحد لكل مضيف في نطاقه هو، موكَّلًا إلى النفق نفسه. النطاق قد يكون له
+# توكنه الخاص، فيُبدَّل التوكن لمدة النداء ثم يُعاد.
+dns_one() { # $1 المضيف  $2 معرّف النطاق
+    _dh=$1; _dz=${2:-}
+    [ -n "$_dh" ] || return 1
+    if [ -z "$_dz" ]; then
+        err "لا معرّف نطاق للمضيف $_dh — عيّنه بـ: sh $SELF host-add $_dh <zone-id>"
+        return 1
+    fi
     _content="$TUNNEL_ID.cfargotunnel.com"
-    _r=$(cf GET "/zones/$CF_ZONE/dns_records?type=CNAME&name=$CF_HOSTNAME")
-    cf_success "$_r" || die "تعذر قراءة سجلات DNS: $(cf_errors "$_r")"
+    _keep=$CF_TOKEN
+    CF_TOKEN=$(zone_token "$_dz")
+    _r=$(cf GET "/zones/$_dz/dns_records?type=CNAME&name=$_dh")
+    if ! cf_success "$_r"; then
+        CF_TOKEN=$_keep
+        err "تعذر قراءة سجلات DNS لـ $_dh: $(cf_errors "$_r")"
+        return 1
+    fi
     _rec=$(jf "$_r" '@.result[0].id')
     _body=$(printf '{"type":"CNAME","name":"%s","content":"%s","proxied":true,"ttl":1}' \
-            "$CF_HOSTNAME" "$_content")
+            "$_dh" "$_content")
     if [ -n "$_rec" ]; then
-        _r=$(cf PUT "/zones/$CF_ZONE/dns_records/$_rec" "$_body")
+        _r=$(cf PUT "/zones/$_dz/dns_records/$_rec" "$_body")
         _act="حُدِّث"
     else
-        _r=$(cf POST "/zones/$CF_ZONE/dns_records" "$_body")
+        _r=$(cf POST "/zones/$_dz/dns_records" "$_body")
         _act="أُنشئ"
     fi
-    cf_success "$_r" || die "فشل سجل DNS: $(cf_errors "$_r")"
-    ok "$_act سجل CNAME: $CF_HOSTNAME ← $_content"
+    CF_TOKEN=$_keep
+    cf_success "$_r" || { err "فشل سجل DNS لـ $_dh: $(cf_errors "$_r")"; return 1; }
+    ok "$_act سجل CNAME: $_dh ← $_content"
+}
+
+create_or_update_dns() {
+    hosts_init
+    _any=0; _bad=0
+    while IFS="$(printf '\t')" read -r _dh0 _dz0; do
+        [ -n "$_dh0" ] || continue
+        _any=1
+        dns_one "$_dh0" "$_dz0" || _bad=1
+    done <"$HOSTS"
+    # تثبيت جديد: hosts.tsv لم يُكتب بعد، فالمضيف الوحيد من المتغيّرات
+    [ "$_any" = 1 ] || { dns_one "$CF_HOSTNAME" "$CF_ZONE" || return 1; return 0; }
+    [ "$_bad" = 0 ] || die "فشل سجل DNS لمضيف واحد على الأقل — راجع الأسطر الحمراء أعلاه."
+    return 0
 }
 
 # ----------------------------------------------------------------- [4/6] ملفات الإعداد
@@ -615,6 +807,9 @@ write_configs() {
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
     XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
+    XRAY_PROTOS=${FULLTUNNEL_PROTOS:-$XRAY_PROTO}
+    TROJAN_PORT=$(( XRAY_PORT + 2 ))
+    TROJAN_PATH=${FULLTUNNEL_TROJAN_PATH:-/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)}
     SSHWS=${FULLTUNNEL_SSHWS:-0}
     SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh-$(head -c 8 /dev/urandom | md5sum | cut -c1-8)}
     SSH_PORT=$(( XRAY_PORT + 1 ))
@@ -622,11 +817,12 @@ write_configs() {
     users_init
     if [ ! -s "$USERS" ]; then
         XRAY_UUID=${FULLTUNNEL_XRAY_UUID:-$(cat /proc/sys/kernel/random/uuid)}
-        printf '%s\t%s\n' "$XRAY_UUID" "${FULLTUNNEL_USER:-user1}" >"$USERS"
+        printf '%s\t%s\t%s\n' "$XRAY_UUID" "${FULLTUNNEL_USER:-user1}" "$(gen_pass)" >"$USERS"
         chmod 600 "$USERS"
     else
         XRAY_UUID=$(awk -F'\t' 'NF{print $1; exit}' "$USERS")
     fi
+    hosts_init
     write_cfd_config
     write_xray_config
     ok "كُتبت ملفات الإعداد"
@@ -715,6 +911,9 @@ FULLTUNNEL_XRAY_PORT=$XRAY_PORT
 FULLTUNNEL_XRAY_LISTEN=$XRAY_LISTEN
 FULLTUNNEL_XRAY_NET=${XRAY_NET:-ws}
 FULLTUNNEL_PROTO=${XRAY_PROTO:-vless}
+FULLTUNNEL_PROTOS=$(protos_enabled | tr ' ' ',')
+FULLTUNNEL_TROJAN_PATH=${TROJAN_PATH:-}
+FULLTUNNEL_TROJAN_PORT=$(trojan_port)
 FULLTUNNEL_SSHWS=${SSHWS:-0}
 FULLTUNNEL_SSH_PATH=${SSH_PATH:-/ssh}
 FULLTUNNEL_SSH_PORT=${SSH_PORT:-0}
@@ -739,6 +938,12 @@ load_settings() {
     XRAY_LISTEN=${FULLTUNNEL_XRAY_LISTEN:-127.0.0.1}
     XRAY_NET=${FULLTUNNEL_XRAY_NET:-ws}
     XRAY_PROTO=${FULLTUNNEL_PROTO:-vless}
+    XRAY_PROTOS=${FULLTUNNEL_PROTOS:-$XRAY_PROTO}
+    TROJAN_PORT=${FULLTUNNEL_TROJAN_PORT:-$(( ${XRAY_PORT:-18443} + 2 ))}
+    # تثبيت أقدم بلا مسار trojan: يُشتقّ من مسار vless اشتقاقًا ثابتًا بدل
+    # مشاركته — مساران متطابقان يجعلان الحافة توجّه البروتوكولين إلى مدخل واحد.
+    TROJAN_PATH=${FULLTUNNEL_TROJAN_PATH:-}
+    [ -n "$TROJAN_PATH" ] || TROJAN_PATH="${FULLTUNNEL_XRAY_PATH:-/tj}-tj"
     SSHWS=${FULLTUNNEL_SSHWS:-0}
     SSH_PATH=${FULLTUNNEL_SSH_PATH:-/ssh}
     SSH_PORT=${FULLTUNNEL_SSH_PORT:-0}
@@ -1069,6 +1274,7 @@ BASE=/etc/xe3000-cf-fulltunnel
 CREDS=/etc/xe3000-cf-fulltunnel-creds
 SETTINGS=$BASE/state/settings.env
 USERS=$BASE/state/users.tsv
+HOSTS=$BASE/state/hosts.tsv
 INSTALLER='@SELF@'
 Q=${QUERY_STRING:-}
 MSG=; CLS=msg
@@ -1123,13 +1329,26 @@ svc() {
   else printf 'غير مثبت'; fi
 }
 
-HOSTV=; TIDV=; PATHV=
+HOSTV=; TIDV=; PATHV=; TPATHV=; PROTOSV=; NETV=
 if [ -f "$SETTINGS" ]; then
   HOSTV=$(sed -n 's/^FULLTUNNEL_HOSTNAME=//p' "$SETTINGS")
   TIDV=$(sed -n 's/^FULLTUNNEL_TUNNEL_ID=//p' "$SETTINGS")
   PATHV=$(sed -n 's/^FULLTUNNEL_XRAY_PATH=//p' "$SETTINGS")
+  TPATHV=$(sed -n 's/^FULLTUNNEL_TROJAN_PATH=//p' "$SETTINGS")
+  PROTOSV=$(sed -n 's/^FULLTUNNEL_PROTOS=//p' "$SETTINGS" | tr ',' ' ')
+  [ -n "$PROTOSV" ] || PROTOSV=$(sed -n 's/^FULLTUNNEL_PROTO=//p' "$SETTINGS")
+  NETV=$(sed -n 's/^FULLTUNNEL_XRAY_NET=//p' "$SETTINGS")
 fi
+[ -n "$PROTOSV" ] || PROTOSV=vless
+[ -n "$NETV" ] || NETV=ws
+# نفس اشتقاق load_settings: مساران متطابقان يوجّهان البروتوكولين إلى مدخل واحد
+[ -n "$TPATHV" ] || TPATHV="$PATHV-tj"
+HOSTLIST=$(awk -F'\t' 'NF{print $1}' "$HOSTS" 2>/dev/null)
+[ -n "$HOSTLIST" ] || HOSTLIST=$HOSTV
+NHOST=$(printf '%s\n' $HOSTLIST | awk 'NF{n++} END{print n+0}')
+NPROTO=$(printf '%s\n' $PROTOSV | awk 'NF{n++} END{print n+0}')
 EPATH=$(printf '%s' "$PATHV" | sed 's|/|%2F|g')
+ETPATH=$(printf '%s' "$TPATHV" | sed 's|/|%2F|g')
 [ -s "$CREDS/api-token" ] && CRED=محفوظة || CRED="غير محفوظة"
 
 printf 'Content-Type: text/html; charset=utf-8\r\n\r\n'
@@ -1169,7 +1388,8 @@ HTML
 if installed; then
 cat <<HTML
 <div class="card"><h2>الحالة</h2><table>
-<tr><td>المضيف</td><td>$HOSTV</td></tr>
+<tr><td>المضيفون</td><td>$(printf '%s ' $HOSTLIST)</td></tr>
+<tr><td>البروتوكولات</td><td>$PROTOSV</td></tr>
 <tr><td>معرّف النفق</td><td class="uid">$TIDV</td></tr>
 <tr><td>xray</td><td>$(svc xe3000-cf-xray)</td></tr>
 <tr><td>cloudflared</td><td>$(svc xe3000-cf-tunnel)</td></tr>
@@ -1182,10 +1402,8 @@ cat <<HTML
 <div class="card"><h2>المستخدمون</h2>
 HTML
   if [ -s "$USERS" ]; then
-    while IFS="$(printf '\t')" read -r U N; do
+    while IFS="$(printf '\t')" read -r U N P; do
       [ -n "$U" ] || continue
-      LINK="vless://$U@$HOSTV:443?encryption=none&security=tls&sni=$HOSTV&type=ws&host=$HOSTV&path=$EPATH#$N"
-      LE=$(printf '%s' "$LINK" | esc)
       NE=$(printf '%s' "$N" | esc)
       cat <<HTML
 <div class="u">
@@ -1196,13 +1414,29 @@ HTML
       <button class="del">حذف</button></form>
   </div>
   <div class="uid">$U</div>
+HTML
+      # رابط لكل (مضيف × بروتوكول): يختار العميل ما يعمل في شبكته
+      for H in $HOSTLIST; do
+        for PR in $PROTOSV; do
+          TAG=$N
+          [ "$NHOST" -gt 1 ] && TAG="$TAG@${H%%.*}"
+          [ "$NPROTO" -gt 1 ] && TAG="$TAG-$PR"
+          case "$PR" in
+            trojan) LINK="trojan://$P@$H:443?security=tls&sni=$H&type=$NETV&host=$H&path=$ETPATH#$TAG" ;;
+            *)      LINK="vless://$U@$H:443?encryption=none&security=tls&sni=$H&type=$NETV&host=$H&path=$EPATH#$TAG" ;;
+          esac
+          LE=$(printf '%s' "$LINK" | esc)
+          TE=$(printf '%s' "$TAG" | esc)
+          cat <<HTML
   <div class="lk">
     <input readonly value="$LE">
-    <button class="sec" onclick="cp(this)">نسخ الرابط</button>
+    <button class="sec" onclick="cp(this)">نسخ $TE</button>
   </div>
   <div class="qr" data-link="$LE"></div>
-</div>
 HTML
+        done
+      done
+      printf '</div>'
     done <"$USERS"
   else
     printf '<p class="warn">لا يوجد مستخدمون.</p>'
@@ -1535,20 +1769,17 @@ do_install() {
 
 show_client() {
     say ""
-    say "بيانات العميل (VLESS + WebSocket عبر Cloudflare):"
-    say "  العنوان : $CF_HOSTNAME   المنفذ: 443   TLS: مُفعّل"
-    say "  المسار  : $XRAY_WSPATH   |   الشبكة: ws"
+    say "بيانات العميل (عبر Cloudflare، المنفذ 443، TLS مُفعّل):"
+    hosts_init
+    for _ch in $(hosts_names); do say "  المضيف  : $_ch"; done
+    for _cp in $(protos_enabled); do
+        say "  $_cp: المسار $(proto_path "$_cp")   |   الشبكة: ${XRAY_NET:-ws}"
+    done
     say ""
     say "روابط الاشتراك الكاملة:"
-    users_init
-    while IFS="$(printf '\t')" read -r _u _n; do
-        [ -n "$_u" ] || continue
-        say ""
-        say "[$_n]"
-        user_link "$_u" "$_n"; say ""
-    done <"$USERS"
+    # نفس مولّد links: رابط لكل (مستخدم × مضيف × بروتوكول) وبكلمة مرور trojan
+    users_links
     say ""
-    show_ssh
     say "لرمز QR ونسخ الروابط بضغطة: https://$(lan_ip):$UI_PORT/cgi-bin/control.cgi"
 }
 
@@ -1559,7 +1790,8 @@ do_status() {
         return 1
     fi
     say "الإصدار    : $VERSION"
-    say "المضيف     : $CF_HOSTNAME"
+    say "المضيفون   : $(hosts_names | tr '\n' ' ')"
+    say "البروتوكول : $(protos_enabled)"
     say "النفق      : $TUNNEL_NAME ($TUNNEL_ID)"
     for s in xe3000-cf-xray xe3000-cf-tunnel; do
         if [ -x /etc/init.d/$s ] && /etc/init.d/$s running >/dev/null 2>&1; then
@@ -1751,7 +1983,7 @@ do_menu() {
         printf '\n'
         say "══════ XE3000 Full-Tunnel ══════"
         if load_settings 2>/dev/null; then
-            say "  المضيف: $CF_HOSTNAME    المستخدمون: $(users_count)"
+            say "  المضيفون: $(hosts_names | tr '\n' ' ')   المستخدمون: $(users_count)   البروتوكول: $(protos_enabled)"
             say "  xray: $(/etc/init.d/xe3000-cf-xray running >/dev/null 2>&1 && echo يعمل || echo متوقف)   cloudflared: $(/etc/init.d/xe3000-cf-tunnel running >/dev/null 2>&1 && echo يعمل || echo متوقف)"
         else
             say "  غير مثبت"
@@ -1761,7 +1993,8 @@ do_menu() {
         say "  3) الروابط           4) تشغيل/إيقاف/إعادة"
         say "  5) تشخيص             6) تبديل التوكن"
         say "  7) حماية اللوحة      8) لوحة 9000"
-        say "  9) تثبيت/إكمال       0) خروج"
+        say "  9) تثبيت/إكمال      10) المضيفون والبروتوكولات"
+        say "  0) خروج"
         read_tty "الاختيار: " _c
         case "$_c" in
             1) do_status ;;
@@ -1779,11 +2012,28 @@ do_menu() {
                esac ;;
             8) say "https://$(lan_ip):$UI_PORT_S/cgi-bin/control.cgi  (أو http://$(lan_ip):$UI_PORT/)" ;;
             9) do_auto_self || true ;;
+            10) menu_hosts ;;
             0|q|Q) return 0 ;;
             *) warn "اختيار غير معروف." ;;
         esac
         menu_pause
     done
+}
+
+menu_hosts() {
+    say "  1) المضيفون   2) إضافة مضيف   3) حذف مضيف   4) البروتوكولات   0) رجوع"
+    read_tty "الاختيار: " _c
+    case "$_c" in
+        1) hosts_list ;;
+        2) read_tty "المضيف الجديد: " _n; read_tty "Zone ID (اتركه فارغًا للاستدلال): " _z
+           do_host_add "$_n" "$_z" ;;
+        3) hosts_list; read_tty "المضيف المراد حذفه: " _n; do_host_del "$_n" ;;
+        4) do_proto_list
+           read_tty "بروتوكول للتبديل (vless/trojan، فارغ للرجوع): " _p
+           [ -n "$_p" ] || return 0
+           if proto_on "$_p"; then do_proto_set off "$_p"; else do_proto_set on "$_p"; fi ;;
+        *) return 0 ;;
+    esac
 }
 
 menu_users() {
@@ -1842,7 +2092,7 @@ _probe() { # $1 = رابط، بقية الوسائط ترويسات
     _u=$1; shift
     _us=
     case "$_u" in
-        http://localhost*) is_sock && _us="--unix-socket $XRAY_LISTEN" ;;
+        http://localhost*) is_sock && _us="--unix-socket ${PROBE_SOCK:-$XRAY_LISTEN}" ;;
     esac
     _pe=/tmp/.xe3000probe.$$
     _po=$(curl -sSi --noproxy '*' $_us --max-time 6 --http1.1 "$@" "$_u" 2>"$_pe")
@@ -1855,8 +2105,17 @@ _probe() { # $1 = رابط، بقية الوسائط ترويسات
     printf '%s' "$_pl"
 }
 
-local_url() { if is_sock; then printf 'http://localhost%s' "$XRAY_WSPATH"
-              else printf 'http://%s:%s%s' "$XRAY_LISTEN" "$XRAY_PORT" "$XRAY_WSPATH"; fi; }
+# مقبس/منفذ كل بروتوكول على حدة — لكل مدخل أصله الخاص
+proto_sock() { if [ "${1:-vless}" = trojan ]; then trojan_listen
+               else printf '%s' "$XRAY_LISTEN"; fi; }
+
+local_url() { # $1 = البروتوكول (افتراضيًا vless)
+    _lu=${1:-vless}
+    if is_sock; then printf 'http://localhost%s' "$(proto_path "$_lu")"
+    elif [ "$_lu" = trojan ]; then
+        printf 'http://%s:%s%s' "$XRAY_LISTEN" "$(trojan_port)" "$(proto_path trojan)"
+    else printf 'http://%s:%s%s' "$XRAY_LISTEN" "$XRAY_PORT" "$(proto_path "$_lu")"; fi
+}
 
 ws_probe() {
     _probe "$1" \
@@ -1928,31 +2187,56 @@ do_selftest() {
     _cfg=$XRAY_DIR/config.json
     if [ -s "$_cfg" ]; then
         _j=$(cat "$_cfg")
-        _cp=$(jf "$_j" '@.inbounds[0].port')
-        _cn=$(jf "$_j" '@.inbounds[0].streamSettings.network')
-        _cw=$(jf "$_j" '@.inbounds[0].streamSettings.wsSettings.path')
-        _cl=$(jf "$_j" '@.inbounds[0].listen')
-        _cpr=$(jf "$_j" '@.inbounds[0].protocol')
-        say "    protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
-        _cw=${_cw:-$(jf "$_j" '@.inbounds[0].streamSettings.xhttpSettings.path')}
-        say "    path في config.json : $_cw"
-        say "    path في settings.env: $XRAY_WSPATH"
-        case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
-        [ "$_cw" = "$XRAY_WSPATH" ] || { err "المساران غير متطابقين — أعد التطبيق: sh $SELF users-apply"; _fail=1; }
-        is_sock || [ "$_cp" = "$XRAY_PORT" ] || { err "المنفذان غير متطابقين."; _fail=1; }
+        say "    البروتوكولات في settings.env: $(protos_enabled)"
+        _ix=0
+        for _sp in $(protos_enabled); do
+            _cpr=$(jf "$_j" "@.inbounds[$_ix].protocol")
+            _cl=$(jf "$_j" "@.inbounds[$_ix].listen")
+            _cp=$(jf "$_j" "@.inbounds[$_ix].port")
+            _cn=$(jf "$_j" "@.inbounds[$_ix].streamSettings.network")
+            _cw=$(jf "$_j" "@.inbounds[$_ix].streamSettings.wsSettings.path")
+            _cw=${_cw:-$(jf "$_j" "@.inbounds[$_ix].streamSettings.xhttpSettings.path")}
+            say "    [$_ix] protocol=$_cpr  listen=$_cl  port=$_cp  network=$_cn"
+            say "         path في config.json : $_cw"
+            say "         path في settings.env: $(proto_path "$_sp")"
+            [ "$_cpr" = "$_sp" ] || {
+                err "المدخل $_ix بروتوكوله '$_cpr' والمتوقع '$_sp' — أعد التطبيق: sh $SELF users-apply"
+                _fail=1; }
+            case "$_cn" in ws|xhttp) : ;; *) err "network غير مدعوم: $_cn"; _fail=1 ;; esac
+            [ "$_cw" = "$(proto_path "$_sp")" ] || {
+                err "مسار $_sp غير متطابق — أعد التطبيق: sh $SELF users-apply"; _fail=1; }
+            if ! is_sock; then
+                if [ "$_sp" = trojan ]; then _xp=$(trojan_port); else _xp=$XRAY_PORT; fi
+                [ "$_cp" = "$_xp" ] || { err "منفذ $_sp غير متطابق ($_cp ≠ $_xp)."; _fail=1; }
+            fi
+            _ix=$((_ix+1))
+        done
     else
         err "$_cfg مفقود أو فارغ."; _fail=1
     fi
 
     # links يطبع من users.tsv بينما xray يعمل بـ config.json. تفاوتهما يُظهر
     # رابطًا يبدو سليمًا ويرفضه الخادم بـ "invalid request user id".
+    # grep -o لا sed: كل العملاء على سطر واحد في config.json، و.* الجَشِعة
+    # كانت تُرجع آخر معرّف في السطر وحده فيبدو التطابق فاشلًا بلا سبب.
     if [ -f "$XRAY_DIR/config.json" ] && [ -s "$USERS" ]; then
-        _uids=$(awk -F'\t' 'NF{print $1}' "$USERS" | sort | tr '\n' ' ')
-        _cids=$(sed -n 's/.*"id": "\([^"]*\)".*/\1/p' "$XRAY_DIR/config.json" | sort | tr '\n' ' ')
-        if [ "$_uids" = "$_cids" ]; then
-            ok "قائمة المستخدمين ومعرّفات xray متطابقة ($(users_count))"
+        _match=1
+        if proto_on vless; then
+            _uids=$(awk -F'\t' 'NF{print $1}' "$USERS" | sort | tr '\n' ' ')
+            _cids=$(grep -o '"id": "[^"]*"' "$XRAY_DIR/config.json" |
+                    sed 's/.*"id": "//; s/"$//' | sort | tr '\n' ' ')
+            [ "$_uids" = "$_cids" ] || { err "معرّفات vless لا تطابق قائمة المستخدمين."; _match=0; }
+        fi
+        if proto_on trojan; then
+            _upw=$(awk -F'\t' 'NF{print ($3!=""?$3:$1)}' "$USERS" | sort | tr '\n' ' ')
+            _cpw=$(grep -o '"password": "[^"]*"' "$XRAY_DIR/config.json" |
+                   sed 's/.*"password": "//; s/"$//' | sort | tr '\n' ' ')
+            [ "$_upw" = "$_cpw" ] || { err "كلمات مرور trojan لا تطابق قائمة المستخدمين."; _match=0; }
+        fi
+        if [ "$_match" = 1 ]; then
+            ok "قائمة المستخدمين وبيانات xray متطابقة ($(users_count))"
         else
-            err "معرّفات xray لا تطابق قائمة المستخدمين — الروابط ستُرفض."; _fail=1
+            _fail=1
             say "    xray سيردّ: invalid request user id"
             say "    أصلحه بـ: sh $SELF users-apply"
         fi
@@ -2048,7 +2332,10 @@ do_selftest() {
 
     say ""
     say "── 3أ) هل يتكلم xray بروتوكول HTTP على المنفذ؟ ──"
-    _h=$(http_probe "$(local_url)")
+    for _sp in $(protos_enabled); do
+    PROBE_SOCK=$(proto_sock "$_sp")
+    say "  [$_sp] $(local_url "$_sp")"
+    _h=$(http_probe "$(local_url "$_sp")")
     case "$_h" in
         *400*)  ok "ردّ 400 على GET عادي — خادم ws حيّ (هذا هو المتوقع)" ;;
         *404*)  warn "ردّ 404 — الخادم حيّ لكن المسار لا يطابق" ;;
@@ -2069,13 +2356,17 @@ do_selftest() {
         '')     err "لا مخرجات من curl على المنفذ المحلي."; _fail=1 ;;
         *)      say "    ردّ: $_h" ;;
     esac
+    done
+    PROBE_SOCK=
 
     say ""
     say "── 3ب) مصافحة WebSocket محليًا ──"
     # ترقية ناجحة تُبقي الاتصال مفتوحًا، فلا يصلح %{http_code}: نقرأ سطر الحالة نفسه.
-    _l=$(ws_probe "$(local_url)")
+    for _sp in $(protos_enabled); do
+    PROBE_SOCK=$(proto_sock "$_sp")
+    _l=$(ws_probe "$(local_url "$_sp")")
     case "$_l" in
-        *101*) ok "xray قبل الترقية على المسار $XRAY_WSPATH" ;;
+        *101*) ok "[$_sp] xray قبل الترقية على المسار $(proto_path "$_sp")" ;;
         curl:*) if is_sock; then warn "الفحص المحلي غير متاح: $_l"
                 else err "curl لم يصل إلى xray — $_l"; _fail=1; fi ;;
         '')    err "لا سطر استجابة من xray على $XRAY_WSPATH"
@@ -2088,6 +2379,8 @@ do_selftest() {
                _fail=1 ;;
         *)     err "xray ردّ: $_l (المتوقع 101)"; _fail=1 ;;
     esac
+    done
+    PROBE_SOCK=
 
     say ""
     say "── 4) اتصالات النفق لدى Cloudflare ──"
@@ -2122,37 +2415,48 @@ do_selftest() {
     fi
 
     say ""
-    say "── 5) DNS للمضيف ──"
-    if nslookup "$CF_HOSTNAME" >/dev/null 2>&1; then
-        ok "$CF_HOSTNAME يُحوّل"
-    else
-        err "$CF_HOSTNAME لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
-        _fail=1
-    fi
+    say "── 5) DNS للمضيفين ──"
+    _sh_all=$(hosts_names)
+    [ -n "$_sh_all" ] || _sh_all=$CF_HOSTNAME
+    for _sh in $_sh_all; do
+        if nslookup "$_sh" >/dev/null 2>&1; then
+            ok "$_sh يُحوّل"
+        else
+            err "$_sh لا يُحوّل — سجل CNAME مفقود أو لم ينتشر بعد."
+            _fail=1
+        fi
+    done
 
     say ""
     say "── 6) الطلب العام عبر Cloudflare ──"
-    _e=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$CF_HOSTNAME/" 2>&1)
-    case "$_e" in
-        404) ok "الحافة تصل إلى cloudflared (404 من ingress هو المتوقع للجذر)" ;;
-        530) err "خطأ 530 — DNS يشير إلى النفق لكن لا اتصال نشط من cloudflared."; _fail=1 ;;
-        000|curl*)
-            warn "الراوتر نفسه لم يصل إلى https://$CF_HOSTNAME/ ($_e)"
-            say  "    كثيرًا ما يعجز الراوتر عن طلب مضيفه العام من الداخل؛"
-            say  "    جرّبه من الهاتف أو حاسوب خارج الشبكة قبل عدّه عطلًا." ;;
-        *)   say "    الحافة ردّت $_e" ;;
-    esac
+    for _sh in $_sh_all; do
+        _e=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$_sh/" 2>&1)
+        case "$_e" in
+            404) ok "$_sh: الحافة تصل إلى cloudflared (404 من ingress متوقع للجذر)" ;;
+            530) err "$_sh: خطأ 530 — DNS يشير إلى النفق ولا اتصال نشط من cloudflared."; _fail=1 ;;
+            000|curl*)
+                warn "الراوتر نفسه لم يصل إلى https://$_sh/ ($_e)"
+                say  "    كثيرًا ما يعجز الراوتر عن طلب مضيفه العام من الداخل؛"
+                say  "    جرّبه من الهاتف أو حاسوب خارج الشبكة قبل عدّه عطلًا." ;;
+            *)   say "    $_sh: الحافة ردّت $_e" ;;
+        esac
+    done
 
     say ""
-    _l=$(ws_probe "https://$CF_HOSTNAME$XRAY_WSPATH")
-    case "$_l" in
-        *101*) ok "المسار العام يصل إلى xray — السلسلة كاملة تعمل."; _public_ok=1 ;;
-        *404*) err "الحافة ترد 404 على المسار — path في العميل لا يطابق الإعداد."; _fail=1 ;;
-        curl:*) err "curl لم يصل إلى المسار العام — $_l"
-                say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)" ;;
-        '')    err "لا سطر استجابة على المسار العام."; _fail=1 ;;
-        *)     err "المسار العام ردّ: $_l (المتوقع 101)"; _fail=1 ;;
-    esac
+    # 101 من مضيف واحد يثبت السلسلة؛ البقية قد تتأخّر بانتشار DNS أو حجب محلي
+    for _sh in $_sh_all; do
+      for _sp in $(protos_enabled); do
+        _l=$(ws_probe "https://$_sh$(proto_path "$_sp")")
+        case "$_l" in
+            *101*) ok "$_sh [$_sp]: المسار العام يصل إلى xray."; _public_ok=1 ;;
+            *404*) err "$_sh [$_sp]: الحافة ترد 404 — المسار لا يطابق قاعدة ingress."; _fail=1 ;;
+            curl:*) err "$_sh [$_sp]: curl لم يصل — $_l"
+                    say "    (الراوتر كثيرًا ما يعجز عن طلب مضيفه العام من الداخل)" ;;
+            '')    err "$_sh [$_sp]: لا سطر استجابة على المسار العام."; _fail=1 ;;
+            *)     err "$_sh [$_sp]: ردّ $_l (المتوقع 101)"; _fail=1 ;;
+        esac
+      done
+    done
 
     say ""
     if [ "$_fail" = 0 ]; then
@@ -2235,15 +2539,75 @@ do_set_transport() {
     say "أو من اللوحة برمز QR."
 }
 
+# مسار trojan يُولَّد عشوائيًا عند أول تفعيل. تثبيت أقدم بلا مسار محفوظ
+# يشتقّ واحدًا في load_settings، لكن مسارًا عشوائيًا أفضل حين نكتبه أصلًا.
+trojan_path_init() {
+    grep -q '^FULLTUNNEL_TROJAN_PATH=.' "$SETTINGS" 2>/dev/null && return 0
+    TROJAN_PATH=/$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
+}
+
+do_proto_list() {
+    load_settings || die "لا يوجد تثبيت محلي."
+    for _p in vless trojan; do
+        if proto_on "$_p"; then
+            if [ "$_p" = trojan ]; then _pp=$(trojan_port); else _pp=$XRAY_PORT; fi
+            is_sock && _pp=$(if [ "$_p" = trojan ]; then trojan_listen; else printf '%s' "$XRAY_LISTEN"; fi)
+            printf '%-7s مفعّل   مسار=%-20s  أصل=%s\n' "$_p" "$(proto_path "$_p")" "$_pp"
+        else
+            printf '%-7s معطّل\n' "$_p"
+        fi
+    done
+    say ""
+    say "الاثنان يعملان معًا: تفصل بينهما الحافة بالمسار، ولكل واحد أصله."
+    say "  sh $SELF proto-enable trojan   /  proto-disable trojan"
+}
+
+# تفعيل/تعطيل بروتوكول بلا مساس بقائمة المستخدمين: من عُطّل بروتوكوله يبقى
+# مستخدمًا بمعرّفه وكلمة مروره، ويعود بمجرّد إعادة التفعيل.
+do_proto_set() { # $1 = on|off   $2 = vless|trojan
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    _op=$1
+    case "${2:-}" in
+        vless|trojan) _tp=$2 ;;
+        *) die "الاستعمال: proto-$( [ "$_op" = on ] && printf enable || printf disable ) <vless|trojan>" ;;
+    esac
+    _was=$(protos_enabled)
+    _new=
+    for _p in vless trojan; do
+        if [ "$_p" = "$_tp" ]; then
+            [ "$_op" = on ] && _new="$_new${_new:+ }$_p"
+        elif proto_on "$_p"; then
+            _new="$_new${_new:+ }$_p"
+        fi
+    done
+    [ -n "$_new" ] || die "لا يمكن تعطيل آخر بروتوكول — فعّل الآخر أولًا."
+    [ "$_new" = "$_was" ] && { ok "لا تغيير — القائمة هي نفسها: $_was"; return 0; }
+    [ "$_tp" = trojan ] && [ "$_op" = on ] && trojan_path_init
+    XRAY_PROTOS=$_new
+    XRAY_PROTO=${_new%% *}
+    save_settings
+    users_apply
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    # القياس من الملف المكتوب لا من المتغيّر: كتابة فاشلة كانت تُعلن نجاحًا
+    _now=$(sed -n 's/^FULLTUNNEL_PROTOS=//p' "$SETTINGS" | head -1 | tr ',' ' ')
+    [ "$_now" = "$_new" ] || die "لم تُكتب القائمة في $SETTINGS (فيه '$_now')."
+    ok "البروتوكولات المفعّلة: $_new"
+    warn "روابط العملاء تغيّرت — أعد استيرادها: sh $SELF links"
+}
+
 do_set_protocol() {
     need_root
     load_settings || die "لا يوجد تثبيت محلي."
     case "${1:-}" in
-        vless|trojan) XRAY_PROTO=$1 ;;
-        *) die "البروتوكول: vless أو trojan" ;;
+        vless|trojan) XRAY_PROTO=$1; XRAY_PROTOS=$1 ;;
+        *) die "البروتوكول: vless أو trojan  (لتشغيلهما معًا: sh $SELF proto-enable <اسم>)" ;;
     esac
-    save_settings; users_apply
-    ok "البروتوكول الآن: $XRAY_PROTO"
+    [ "$XRAY_PROTO" = trojan ] && trojan_path_init
+    save_settings; users_apply; write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "البروتوكول الآن: $XRAY_PROTO (وحده)"
     warn "روابط العملاء تغيّرت — أعد استيرادها: sh $SELF links"
 }
 
@@ -2535,37 +2899,36 @@ do_set_hostname() {
     [ "$_new" = "$CF_HOSTNAME" ] && { ok "لا تغيير — المضيف هو نفسه."; return 0; }
 
     collect_creds
-    _r=$(cf GET "/zones/$CF_ZONE")
+    hosts_init
+    _old=$CF_HOSTNAME
+    _oz=$(host_zone "$_old"); [ -n "$_oz" ] || _oz=$CF_ZONE
+    _keep=$CF_TOKEN; CF_TOKEN=$(zone_token "$_oz")
+    _r=$(cf GET "/zones/$_oz")
+    CF_TOKEN=$_keep
     cf_success "$_r" || die "تعذر قراءة النطاق: $(cf_errors "$_r")"
     _zn=$(jf "$_r" '@.result.name')
     case "$_new" in
         "$_zn"|*".$_zn") : ;;
-        *) die "'$_new' ليس تابعًا للنطاق '$_zn' — لا يمكن إنشاء سجل له." ;;
+        *) die "'$_new' ليس تابعًا للنطاق '$_zn' — لا يمكن إنشاء سجل له.
+    لإضافة مضيف في نطاق آخر: sh $SELF host-add $_new" ;;
     esac
 
-    # شهادة Universal SSL على إعداد full تغطي النطاق والمستوى الأول فقط.
-    # اسم مثل youtube.com.example.com مستوى ثانٍ فتفشل مصافحة TLS بخطأ شهادة.
-    _sub=${_new%".$_zn"}
-    case "$_sub" in
-        "$_new") _depth=0 ;;
-        *.*)     _depth=2 ;;
-        *)       _depth=1 ;;
-    esac
-    if [ "$_depth" = 2 ]; then
-        warn "'$_new' نطاق فرعي من المستوى الثاني."
-        say  "    شهادة Cloudflare المجانية (Universal SSL) تغطي النطاق والمستوى"
-        say  "    الأول فقط، فمصافحة TLS ستفشل بخطأ شهادة ما لم تكن مشتركًا في"
-        say  "    Advanced Certificate Manager أو Total TLS."
-        say  "    البديل المجاني: اسم من مستوى واحد مثل ${_sub%%.*}.$_zn"
-        if has_tty && [ "${FULLTUNNEL_FORCE:-0}" != 1 ]; then
-            read_tty "أتابع رغم ذلك؟ (اكتب نعم): " _y
-            [ "$_y" = "نعم" ] || die "أُلغي — لم يتغيّر شيء."
-        fi
-    fi
+    host_depth_warn "$_new" "$_zn"
 
-    _old=$CF_HOSTNAME
+    dns_one "$_new" "$_oz" || die "فشل إنشاء السجل — لم يتغيّر شيء."
     CF_HOSTNAME=$_new
-    create_or_update_dns || { CF_HOSTNAME=$_old; die "فشل إنشاء السجل — لم يتغيّر شيء."; }
+    # التبديل يمسّ المضيف الأوّل وحده؛ بقية المضيفين تديرها host-add/host-del
+    hosts_init
+    _ht=$STATE/.hosts.$$
+    if host_known "$_old"; then
+        awk -F'\t' -v o="$_old" -v n="$_new" -v z="$_oz" \
+            '{ if ($1==o) printf "%s\t%s\n", n, z; else print }' "$HOSTS" >"$_ht" &&
+            mv "$_ht" "$HOSTS" || { rm -f "$_ht"; die "تعذر تحديث $HOSTS."; }
+    else
+        printf '%s\t%s\n' "$_new" "$_oz" >"$HOSTS"
+    fi
+    chmod 600 "$HOSTS"
+    host_known "$_new" || die "لم يُكتب المضيف الجديد في $HOSTS."
     save_settings
     write_cfd_config
     /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
@@ -2574,6 +2937,146 @@ do_set_hostname() {
     say "انتظر انتشار DNS دقيقة ثم: sh $SELF selftest"
     warn "روابط العملاء تغيّرت — أعد استيرادها:"
     users_links
+}
+
+# شهادة Universal SSL على إعداد full تغطي النطاق والمستوى الأول فقط. اسم مثل
+# youtube.com.example.com مستوى ثانٍ فتفشل مصافحة TLS بخطأ شهادة.
+host_depth_warn() { # $1 المضيف  $2 اسم النطاق
+    _sub=${1%".$2"}
+    case "$_sub" in
+        "$1") return 0 ;;
+        *.*)  : ;;
+        *)    return 0 ;;
+    esac
+    warn "'$1' نطاق فرعي من المستوى الثاني."
+    say  "    شهادة Cloudflare المجانية (Universal SSL) تغطي النطاق والمستوى"
+    say  "    الأول فقط، فمصافحة TLS ستفشل بخطأ شهادة ما لم تكن مشتركًا في"
+    say  "    Advanced Certificate Manager أو Total TLS."
+    say  "    البديل المجاني: اسم من مستوى واحد مثل ${_sub%%.*}.$2"
+    if has_tty && [ "${FULLTUNNEL_FORCE:-0}" != 1 ]; then
+        read_tty "أتابع رغم ذلك؟ (اكتب نعم): " _y
+        [ "$_y" = "نعم" ] || die "أُلغي — لم يتغيّر شيء."
+    fi
+}
+
+# استدلال Zone ID من اسم المضيف: تُجرَّب لواحق الاسم من الأطول إلى الأقصر.
+# يحتاج صلاحية سرد النطاقات؛ إن لم تتوفّر يمرّر المستخدم المعرّف يدويًا.
+zone_lookup() {
+    _zc=$1
+    while : ; do
+        case "$_zc" in *.*) : ;; *) return 1 ;; esac
+        _r=$(cf GET "/zones?name=$_zc")
+        if cf_success "$_r"; then
+            _zi=$(jf "$_r" '@.result[0].id')
+            [ -n "$_zi" ] && { printf '%s' "$_zi"; return 0; }
+        fi
+        _zc=${_zc#*.}
+    done
+}
+
+do_host_list() {
+    load_settings >/dev/null 2>&1 || true
+    hosts_list
+}
+
+# إضافة نطاق آخر إلى النفق نفسه: قاعدة ingress جديدة وسجل CNAME في نطاقه.
+do_host_add() { # $1 المضيف  $2 معرّف النطاق (اختياري)
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    [ -n "$TUNNEL_ID" ] || die "لا يوجد نفق — ثبّت أولًا: sh $SELF auto"
+    hosts_init
+    _nh=${1:-}
+    if [ -z "$_nh" ]; then
+        has_tty || die "الاستعمال: host-add <مضيف.نطاق> [zone-id]"
+        read_tty "المضيف الجديد (مثل cdn.example.net): " _nh
+    fi
+    valid_host "$_nh" || die "اسم مضيف غير صالح: '$_nh'"
+    host_known "$_nh" && { ok "المضيف $_nh مضاف مسبقًا."; return 0; }
+
+    collect_creds
+    _nz=${2:-}
+    [ -n "$_nz" ] || _nz=$(zone_lookup "$_nh")
+    [ -n "$_nz" ] ||
+        die "لم أستدلّ على Zone ID لـ '$_nh' — مرّره: sh $SELF host-add $_nh <zone-id>"
+    valid_id "$_nz" || die "Zone ID غير صالح: '$_nz'"
+
+    _keep=$CF_TOKEN; CF_TOKEN=$(zone_token "$_nz")
+    _r=$(cf GET "/zones/$_nz")
+    CF_TOKEN=$_keep
+    cf_success "$_r" || die "تعذر قراءة النطاق $_nz: $(cf_errors "$_r")
+    إن كان لهذا النطاق توكن خاص فعيّنه أولًا: sh $SELF set-zone-token $_nz"
+    _zn=$(jf "$_r" '@.result.name')
+    case "$_nh" in
+        "$_zn"|*".$_zn") : ;;
+        *) die "'$_nh' ليس تابعًا للنطاق '$_zn' — راجع Zone ID." ;;
+    esac
+    host_depth_warn "$_nh" "$_zn"
+
+    printf '%s\t%s\n' "$_nh" "$_nz" >>"$HOSTS"
+    chmod 600 "$HOSTS"
+    # القياس من المصدر بعد الكتابة — لا إعلان نجاح قبل أن يقرأه الملف
+    host_known "$_nh" || die "لم تُكتب الإضافة في $HOSTS."
+    if ! dns_one "$_nh" "$_nz"; then
+        _ht=$STATE/.hosts.$$
+        awk -F'\t' -v h="$_nh" '$1!=h' "$HOSTS" >"$_ht" && mv "$_ht" "$HOSTS"
+        chmod 600 "$HOSTS"
+        die "فشل سجل DNS — أُزيل المضيف ولم يتغيّر شيء."
+    fi
+    save_settings
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "أُضيف المضيف $_nh (المجموع $(hosts_count))"
+    say "انتظر انتشار DNS دقيقة ثم: sh $SELF selftest"
+    users_links
+}
+
+do_host_del() { # $1 المضيف
+    need_root
+    load_settings || die "لا يوجد تثبيت محلي."
+    hosts_init
+    _dh=${1:-}
+    [ -n "$_dh" ] || die "الاستعمال: host-del <مضيف>"
+    host_known "$_dh" || die "لا مضيف بهذا الاسم: $_dh"
+    [ "$(hosts_count)" -gt 1 ] ||
+        die "لا يمكن حذف آخر مضيف — للتبديل: sh $SELF set-hostname <اسم>"
+    _ht=$STATE/.hosts.$$
+    awk -F'\t' -v h="$_dh" '$1!=h' "$HOSTS" >"$_ht" || { rm -f "$_ht"; die "فشل التحرير."; }
+    mv "$_ht" "$HOSTS"; chmod 600 "$HOSTS"
+    host_known "$_dh" && die "لم يُحذف المضيف من $HOSTS."
+    CF_HOSTNAME=$(host_primary)
+    save_settings
+    write_cfd_config
+    /etc/init.d/xe3000-cf-tunnel restart >/dev/null 2>&1 || warn "تعذر إعادة تشغيل cloudflared"
+    ok "حُذف المضيف $_dh (بقي $(hosts_count))"
+    say "سجل CNAME لـ $_dh لم يُحذف — احذفه من لوحة Cloudflare إن لم تعد تحتاجه."
+}
+
+# توكن مقصور على نطاق واحد: أضيق صلاحية من توكن يملك كل النطاقات.
+do_set_zone_token() { # $1 معرّف النطاق  $2 off لحذفه
+    need_root
+    _zz=${1:-}
+    [ -n "$_zz" ] || die "الاستعمال: set-zone-token <zone-id> [off]"
+    valid_id "$_zz" || die "Zone ID غير صالح: '$_zz'"
+    mkdir -p "$CREDS" || die "تعذر إنشاء $CREDS"
+    chmod 700 "$CREDS"
+    if [ "${2:-}" = off ]; then
+        rm -f "$CREDS/zone-token-$_zz"
+        [ -s "$CREDS/zone-token-$_zz" ] && die "لم يُحذف التوكن الخاص."
+        ok "حُذف التوكن الخاص بالنطاق $_zz — سيُستعمل التوكن العام."
+        return 0
+    fi
+    _zt=${FULLTUNNEL_ZONE_TOKEN:-}
+    [ -n "$_zt" ] || read_tty "توكن النطاق $_zz (Zone · DNS · Edit): " _zt 1
+    valid_id "$_zt" || die "التوكن غير صالح أو فيه محرف زائد."
+    # يُقاس قبل الحفظ: توكن لا يقرأ نطاقه يكسر host-add وتجديد السجلات
+    _keep=${CF_TOKEN:-}; CF_TOKEN=$_zt
+    _r=$(cf GET "/zones/$_zz")
+    CF_TOKEN=$_keep
+    cf_success "$_r" || die "التوكن لا يقرأ النطاق $_zz: $(cf_errors "$_r")"
+    printf '%s' "$_zt" >"$CREDS/zone-token-$_zz"
+    chmod 600 "$CREDS/zone-token-$_zz"
+    [ -s "$CREDS/zone-token-$_zz" ] || die "فشلت كتابة التوكن."
+    ok "حُفظ توكن النطاق $(jf "$_r" '@.result.name') ($_zz)"
 }
 
 do_set_edge_proto() {
@@ -2742,10 +3245,17 @@ XE3000 Cloudflare Full-Tunnel — $VERSION
   sh $SELF set-listen [عنوان] ربط xray على عنوان آخر أو unix
   sh $SELF set-transport <ws|xhttp>  تبديل الناقل
   sh $SELF set-port <رقم>   تبديل المنفذ المحلي
-  sh $SELF set-protocol <vless|trojan>  تبديل البروتوكول
+  sh $SELF set-protocol <vless|trojan>  قصر العمل على بروتوكول واحد
+  sh $SELF proto-list       البروتوكولات ومساراتها
+  sh $SELF proto-enable <vless|trojan>   تفعيله مع الآخر لا بدلًا منه
+  sh $SELF proto-disable <vless|trojan>  تعطيله دون مساس بالمستخدمين
   sh $SELF ssh-ws on|off    جسر SSH عبر WebSocket
   sh $SELF watchdog on [د]|off|test  مراقبة دورية وإعادة تشغيل تلقائية
-  sh $SELF set-hostname <اسم>  تبديل اسم المضيف داخل نطاقك
+  sh $SELF set-hostname <اسم>  تبديل المضيف الأوّل داخل نطاقه
+  sh $SELF host-list        المضيفون ونطاقاتهم
+  sh $SELF host-add <مضيف> [zone-id]  إضافة نطاق آخر إلى النفق نفسه
+  sh $SELF host-del <مضيف>  إزالة مضيف من النفق
+  sh $SELF set-zone-token <zone-id> [off]  توكن خاص بنطاق واحد
   sh $SELF set-edge-protocol <http2|quic|auto>  بروتوكول وصلة الحافة
   sh $SELF vpn-bypass auto|on|off|status  الـ VPN مفضّل، والتجاوز عند فشله
   sh $SELF selftest         فحص السلسلة: xray ← cloudflared ← Cloudflare ← DNS
@@ -2785,9 +3295,16 @@ case "${1:-}" in
     set-transport)      do_set_transport "${2:-}" ;;
     set-port)           do_set_port "${2:-}" ;;
     set-protocol)       do_set_protocol "${2:-}" ;;
+    proto-list)         do_proto_list ;;
+    proto-enable)       do_proto_set on  "${2:-}" ;;
+    proto-disable)      do_proto_set off "${2:-}" ;;
     ssh-ws)             do_sshws "${2:-}" ;;
     watchdog)           do_watchdog "${2:-}" "${3:-}" ;;
     set-hostname)       do_set_hostname "${2:-}" ;;
+    host-list)          do_host_list ;;
+    host-add)           do_host_add "${2:-}" "${3:-}" ;;
+    host-del)           do_host_del "${2:-}" ;;
+    set-zone-token)     do_set_zone_token "${2:-}" "${3:-}" ;;
     set-edge-protocol)  do_set_edge_proto "${2:-}" ;;
     vpn-bypass)         do_vpn_bypass "${2:-auto}" "${3:-}" ;;
     menu)               do_menu ;;
