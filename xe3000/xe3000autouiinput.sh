@@ -2767,6 +2767,15 @@ vr_apply() {
         logger -t xe3000 "vpn-route: لا أرى جدول نفق VPN — تُركت القواعد"; return 0; }
     ip rule    | grep -q "^$VRPREF:" || ip rule    add pref "$VRPREF" iif lo lookup "$_vt" 2>/dev/null
     ip -6 rule | grep -q "^$VRPREF:" || ip -6 rule add pref "$VRPREF" iif lo lookup "$_vt" 2>/dev/null
+
+    # /etc/resolv.conf رابط إلى /tmp/resolv.conf، وnetifd يعيد كتابته عند كل
+    # حدث شبكة فيعيد مُحلِّلات المشغّل — وهي خارج النفق. dnsmasq مضبوط في UCI
+    # على مُحلِّل يصل داخله، فيكفي أن نُبقي الاستعلامات متجهة إليه.
+    if netstat -lun 2>/dev/null | grep -q '127\.0\.0\.1:53 '; then
+        grep -q '^nameserver 127\.0\.0\.1$' /etc/resolv.conf 2>/dev/null || {
+            printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf 2>/dev/null &&
+            logger -t xe3000 "vpn-route: أُعيد توجيه resolv.conf إلى dnsmasq"; }
+    fi
     :
 }
 vr_apply
@@ -3208,6 +3217,10 @@ do_vpn_route() {
                 uci -q commit dhcp; uci -q commit network
                 /etc/init.d/dnsmasq restart >/dev/null 2>&1
                 sleep 3
+                # وجّه استعلامات الراوتر إلى dnsmasq: الملف مؤقت ويُعاد كتابته،
+                # ولهذا يعيده ملف الجدار الناري عند كل إقلاع وإعادة تحميل.
+                netstat -lun 2>/dev/null | grep -q '127\.0\.0\.1:53 ' &&
+                    printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf 2>/dev/null
                 nslookup api.cloudflare.com >/dev/null 2>&1 &&
                     ok "الترجمة تعمل عبر ${VPNROUTE_RESOLVERS:-1.1.1.1}" ||
                     warn "ما زالت الترجمة تفشل — راجع اتصال الـ VPN."
