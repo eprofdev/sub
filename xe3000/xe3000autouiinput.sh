@@ -3201,6 +3201,18 @@ do_vpn_bypass() {
             say "مسار VPN : $(vpn_link_state)"
             say "الوصلات  : ${_rc:-غير متاح} نشطة لدى cloudflared"
             say "القواعد  : $_have/$(fw_bypass_total)"
+            # ما يخرج منه مرور النفق فعلًا — لا ما نظنّه. 198.41.192.7 حافة
+            # Cloudflare، والعلامة تُمرَّر كما تراها قاعدة ip rule.
+            _m0=$(ip route get 198.41.192.7 2>/dev/null | head -1)
+            _m8=$(ip route get 198.41.192.7 mark 0x8000 2>/dev/null | head -1)
+            say "الخروج   : $(printf '%s' "$_m0" | sed -n 's/.*dev \([^ ]*\).*/\1/p') (بلا علامة)"
+            say "           $(printf '%s' "$_m8" | sed -n 's/.*dev \([^ ]*\).*/\1/p') (بعلامة التجاوز)"
+            case "$(printf '%s' "$_m0" | sed -n 's/.*dev \([^ ]*\).*/\1/p')" in
+                wg*|tun*|ppp*|ovpn*|vti*) : ;;
+                '') warn "تعذّرت قراءة مسار الخروج." ;;
+                *) [ "$_have" = 0 ] &&
+                     warn "المسار معطّل التجاوز لكن الخروج ليس عبر نفق VPN — تحقق من اتصال الـ VPN." ;;
+            esac
             grep -qF "$BASE/firewall.sh" "$_cron" 2>/dev/null &&
                 say "المراجعة : مجدولة في cron" || say "المراجعة : غير مجدولة" ;;
         *) die "الاستعمال: vpn-bypass auto|on|off|status" ;;
