@@ -2375,11 +2375,26 @@ _rule() { # $1=عملية $2=بروتوكول $3=منفذ
     iptables -w -t mangle "$1" OUTPUT -p "$2" --dport "$3" -m mark --mark 0x0/0xf000 \
         -j MARK --set-xmark 0x8000/0xf000 2>/dev/null
 }
-add_rules() { for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" || _rule -I "${_e%%:*}" "${_e##*:}"; done; }
-del_rules() { for _e in $PORTS; do while _rule -D "${_e%%:*}" "${_e##*:}"; do :; done; done; }
+
+# اختيار عنوان المصدر يقع في أول بحث عن مسار، قبل mangle/OUTPUT. فإن كان نفق
+# الـ VPN حيًّا اختير عنوانه (مثل 172.19.0.1)، ثم تُعيد علامتنا التوجيه عبر
+# منفذ الإنترنت والمصدر باقٍ كما هو — فتخرج الحزم بعنوان لا يخصّ ذلك المنفذ
+# ولا يعود لها جواب: "i/o timeout". هذه القاعدة تصحّح المصدر عند الخروج.
+_snat() { iptables -w -t nat "$1" POSTROUTING -m mark --mark 0x8000/0xf000 ! -o lo \
+              -j MASQUERADE 2>/dev/null; }
+
+add_rules() {
+    for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" || _rule -I "${_e%%:*}" "${_e##*:}"; done
+    _snat -C || _snat -I
+}
+del_rules() {
+    for _e in $PORTS; do while _rule -D "${_e%%:*}" "${_e##*:}"; do :; done; done
+    while _snat -D; do :; done
+}
 count_rules() {
     _n=0
     for _e in $PORTS; do _rule -C "${_e%%:*}" "${_e##*:}" && _n=$((_n+1)); done
+    _snat -C && _n=$((_n+1))
     echo "$_n"
 }
 
@@ -2475,12 +2490,16 @@ FWIBODY
     chmod 750 "$BASE/firewall.sh"
 }
 
+fw_snat() { iptables -w -t nat "$1" POSTROUTING -m mark --mark 0x8000/0xf000 ! -o lo \
+                -j MASQUERADE 2>/dev/null; }
+
 fw_bypass_del() {
     for _e in $FW_BYPASS_PORTS; do
         _pr=${_e%%:*}; _pt=${_e##*:}
         while iptables -w -t mangle -D OUTPUT -p "$_pr" --dport "$_pt" \
                 -m mark --mark 0x0/0xf000 -j MARK --set-xmark 0x8000/0xf000 2>/dev/null; do :; done
     done
+    while fw_snat -D; do :; done
 }
 
 # لا تُقرأ الحالة من مخرجات السكربت المولَّد بل من الجدول نفسه
@@ -2491,10 +2510,12 @@ fw_bypass_count() {
         iptables -w -t mangle -C OUTPUT -p "$_pr" --dport "$_pt" -m mark --mark 0x0/0xf000 \
             -j MARK --set-xmark 0x8000/0xf000 2>/dev/null && _n=$((_n+1))
     done
+    fw_snat -C && _n=$((_n+1))
     printf '%s' "$_n"
 }
 
-fw_bypass_total() { set -- $FW_BYPASS_PORTS; printf '%s' "$#"; }
+# المنافذ + قاعدة تصحيح المصدر
+fw_bypass_total() { set -- $FW_BYPASS_PORTS; printf '%s' "$(( $# + 1 ))"; }
 
 # بعض الشبكات تقطع مصافحة TLS إلى حافة Cloudflare على 7844/TCP بينما تمرّر
 # 7844/UDP (quic) أو العكس. هذا يبدّل الاثنين بلا مساس بأي إعداد آخر.
